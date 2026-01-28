@@ -2,7 +2,7 @@ import torch
 import os
 import argparse
 from tqdm import tqdm
-import torchvision  # 用于保存图片
+import torchvision
 
 from gaussian_core.provider import EndoDataset
 from gaussian_core.utils import seed_everything
@@ -11,31 +11,28 @@ from gaussian_renderer import render
 from utils.loss_utils import ssim
 from utils.image_utils import psnr
 
-# [重点] 直接从核心文件导入，无需重复定义
+# 导入核心模块
 from watermark_core import WatermarkINN, compute_accuracy
 
 
 def test_watermark(opt):
-    # 路径处理
     model_path = opt.model_path
     if not model_path.endswith("/"): model_path += "/"
 
-    # 确定输出路径
     if opt.output_path is not None:
         output_dir = opt.output_path
     else:
         output_dir = model_path
     os.makedirs(output_dir, exist_ok=True)
 
-    # 图片保存路径
     render_dir = os.path.join(output_dir, "renders")
     if opt.save_images:
         os.makedirs(render_dir, exist_ok=True)
 
     print(f"[INFO] Loading Watermarked Gaussians from: {model_path}")
-    print(f"[INFO] Results will be saved to: {output_dir}")
+    print(f"[INFO] Watermark Length: {opt.wm_len}")
 
-    # 1. 加载 Gaussian Model
+    # 1. 加载 Gaussian
     gaussians = GaussianModel(opt)
     gaussians.load_ply(os.path.join(model_path, "point_cloud.ply"))
     gaussians.load_model(model_path)
@@ -43,31 +40,31 @@ def test_watermark(opt):
     bg_color = [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    # 2. 加载 INN 解码器 & Key
-    # (假设训练脚本最后把 INN 权重也保存到了 workspace 下)
+    # 2. 加载 INN (使用 wm_len)
     print(f"[INFO] Loading INN Decoder and Key...")
-    inn_model = WatermarkINN().cuda()
+    inn_model = WatermarkINN(wm_len=opt.wm_len).cuda()
 
     inn_ckpt_path = os.path.join(model_path, "watermark_inn.pth")
     key_ckpt_path = os.path.join(model_path, "watermark_key.pth")
 
     if not os.path.exists(inn_ckpt_path):
         raise FileNotFoundError(f"Missing watermark_inn.pth in {model_path}")
-    if not os.path.exists(key_ckpt_path):
-        raise FileNotFoundError(f"Missing watermark_key.pth in {model_path}")
 
     inn_model.load_state_dict(torch.load(inn_ckpt_path))
     inn_model.eval()
 
     watermark_key = torch.load(key_ckpt_path).cuda()
-    print(f"[INFO] Loaded Key: {watermark_key[0, :8].cpu().numpy().astype(int)}...")
 
-    # 3. 准备测试数据
+    # 检查长度
+    if watermark_key.shape[1] != opt.wm_len:
+        print(
+            f"[WARNING] Loaded key length ({watermark_key.shape[1]}) != --wm_len ({opt.wm_len}). Using loaded key length.")
+
+    # 3. 准备数据
     device = torch.device('cuda')
     dataset = EndoDataset(opt, device=device, type='test')
     dataloader = dataset.dataloader()
 
-    # 4. 测试循环
     output_file = os.path.join(output_dir, "test_metrics_report.txt")
 
     total_psnr, total_ssim, total_acc = 0.0, 0.0, 0.0
@@ -87,10 +84,10 @@ def test_watermark(opt):
                 render_pkg = render(data['camera'], gaussians, data['time'], background, stage="fine")
                 rendered_image = render_pkg["render"].unsqueeze(0)
 
-                # Extract Watermark
+                # Extract
                 _, w_logits = inn_model.extract(rendered_image)
 
-                # Compute Metrics (Masked)
+                # Metrics
                 masked_render = rendered_image * mask
                 masked_gt = gt_image * mask
 
@@ -103,18 +100,15 @@ def test_watermark(opt):
                 total_acc += cur_acc
                 count += 1
 
-                # Image ID
                 image_id = f"img_{i:04d}"
                 if hasattr(data['camera'], 'image_name'):
                     image_id = data['camera'].image_name
 
-                # Save Image (Optional)
                 if opt.save_images:
                     torchvision.utils.save_image(rendered_image, os.path.join(render_dir, f"{image_id}.png"))
 
                 f.write(f"{image_id:<15} | {cur_psnr:<10.4f} | {cur_ssim:<10.4f} | {cur_acc:<10.4f}\n")
 
-        # Summary
         f.write("-" * 55 + "\n")
         avg_psnr = total_psnr / count
         avg_ssim = total_ssim / count
@@ -128,12 +122,13 @@ def test_watermark(opt):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str, help="Dataset path")
-    parser.add_argument('--model_path', type=str, required=True, help="Path to the watermarked model folder")
-    parser.add_argument('--output_path', type=str, default=None, help="Optional: Path to save results")
-    parser.add_argument('--save_images', action='store_true', help="Save rendered images")
+    parser.add_argument('--model_path', type=str, required=True, help="Watermarked model path")
+    parser.add_argument('--output_path', type=str, default=None, help="Output path")
+    parser.add_argument('--save_images', action='store_true', help="Save images")
+    parser.add_argument('--wm_len', type=int, default=64, help="Watermark length (default: 64)")
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])
 
-    # 必要的初始化参数 (无需修改)
+    # GS Init Params
     parser.add_argument('--sh_degree', type=int, default=3)
     parser.add_argument('--percent_dense', type=float, default=0.01)
     parser.add_argument('--position_lr_init', type=float, default=0.00016)

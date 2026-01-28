@@ -6,7 +6,7 @@ from tqdm import tqdm
 from gaussian_core.provider import EndoDataset
 from gaussian_core.utils import seed_everything
 from utils.loss_utils import l1_loss
-# 导入我们拆分出来的核心模块
+# 导入核心模块
 from watermark_core import WatermarkINN, compute_ber_loss, compute_accuracy
 
 
@@ -16,16 +16,17 @@ def pretrain_inn(opt):
     dataset = EndoDataset(opt, device=device, type='train')
     dataloader = dataset.dataloader()
 
-    # 2. 初始化模型
-    inn_model = WatermarkINN().cuda()
+    # 2. 初始化模型 (传入 wm_len)
+    print(f"Initializing INN with watermark length: {opt.wm_len}")
+    inn_model = WatermarkINN(wm_len=opt.wm_len).cuda()
     optimizer = optim.Adam(inn_model.parameters(), lr=1e-3)
 
-    # 3. 生成并固定密钥
-    watermark_key = torch.randint(0, 2, (1, 64)).float().cuda()
-    print(f"Generated Key: {watermark_key[0, :10].cpu().numpy()}...")
+    # 3. 生成并固定密钥 (长度为 wm_len)
+    watermark_key = torch.randint(0, 2, (1, opt.wm_len)).float().cuda()
+    print(f"Generated Key (First 10 bits): {watermark_key[0, :10].cpu().numpy()}...")
 
     # 4. 训练循环
-    epochs = 50  # 纯图片训练很快，50轮足够收敛
+    epochs = 50
     best_acc = 0.0
 
     os.makedirs(opt.workspace, exist_ok=True)
@@ -46,7 +47,6 @@ def pretrain_inn(opt):
             restored, w_logits = inn_model.extract(wm_image)
 
             # Loss 计算
-            # 只在 Mask 区域保证画质，水印 Loss 则全局计算
             l_img = l1_loss(wm_image * mask, gt_image * mask)
             l_ber = compute_ber_loss(w_logits, watermark_key)
             loss = l_img + l_ber
@@ -71,13 +71,17 @@ def pretrain_inn(opt):
             best_acc = avg_acc
             torch.save(inn_model.state_dict(), os.path.join(opt.workspace, "best_inn.pth"))
             torch.save(watermark_key, os.path.join(opt.workspace, "watermark_key.pth"))
+            # 同时也保存参数配置，方便后续查阅
+            with open(os.path.join(opt.workspace, "config.txt"), "w") as f:
+                f.write(f"wm_len: {opt.wm_len}\n")
             print(f"Saved Best Model to {opt.workspace}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str, help="Dataset path")
-    parser.add_argument('--workspace', type=str, default='output/inn_pretrain', help="Output folder for pretraining")
+    parser.add_argument('--workspace', type=str, default='output/inn_pretrain', help="Output folder")
+    parser.add_argument('--wm_len', type=int, default=64, help="Length of watermark bits (e.g. 64, 128, 256)")
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])
     opt = parser.parse_args()
 

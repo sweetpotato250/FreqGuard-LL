@@ -19,15 +19,26 @@ def train_watermark_frozen(opt, dataloader, gaussians):
     gaussians.load_model(opt.pretrained_model_path)
 
     # 2. 加载预训练好的 INN 并冻结
-    print(f"Loading INN from {opt.inn_path}")
-    inn_model = WatermarkINN().cuda()
-    inn_model.load_state_dict(torch.load(os.path.join(opt.inn_path, "best_inn.pth")))
+    print(f"Loading INN from {opt.inn_path} with wm_len={opt.wm_len}")
+    inn_model = WatermarkINN(wm_len=opt.wm_len).cuda()
+
+    inn_ckpt = os.path.join(opt.inn_path, "best_inn.pth")
+    if not os.path.exists(inn_ckpt):
+        raise FileNotFoundError(f"INN Checkpoint not found: {inn_ckpt}")
+
+    inn_model.load_state_dict(torch.load(inn_ckpt))
     inn_model.eval()
-    # [关键点] 彻底冻结参数，不计算梯度，加速训练
+    # [关键点] 彻底冻结参数
     for param in inn_model.parameters():
         param.requires_grad = False
 
-    watermark_key = torch.load(os.path.join(opt.inn_path, "watermark_key.pth")).cuda()
+    key_ckpt = os.path.join(opt.inn_path, "watermark_key.pth")
+    watermark_key = torch.load(key_ckpt).cuda()
+
+    # 检查 Key 长度是否匹配
+    if watermark_key.shape[1] != opt.wm_len:
+        raise ValueError(
+            f"Key length mismatch! Loaded key has {watermark_key.shape[1]} bits, but --wm_len is {opt.wm_len}")
 
     # 3. 设置 Gaussian 优化器 (降低学习率)
     gaussians.training_setup()
@@ -40,12 +51,10 @@ def train_watermark_frozen(opt, dataloader, gaussians):
     iter_start = 0
     max_iter = opt.watermark_iters
 
-    # [修复进度条] 让进度条对象驱动循环
     progress_bar = tqdm(range(iter_start, max_iter), desc="GS Fine-tuning")
 
-    # 平滑指标记录
     ema_psnr, ema_ssim, ema_acc, ema_loss = 0.0, 0.0, 0.0, 0.0
-    lambda_ber = 0.1  # 控制水印权重
+    lambda_ber = 0.1
 
     for iteration in progress_bar:
         try:
@@ -60,12 +69,11 @@ def train_watermark_frozen(opt, dataloader, gaussians):
         # --- 渲染与 Loss 计算 ---
         gaussians.optimizer.zero_grad(set_to_none=True)
 
-        # 1. 渲染 (Render)
+        # 1. 渲染
         render_pkg = render(data['camera'], gaussians, data['time'], background, stage="fine")
         rendered_image = render_pkg["render"].unsqueeze(0)
 
         # 2. 水印提取 (通过冻结的 INN)
-        # 梯度流向：BER Loss -> Logits -> Rendered Image -> Gaussian Parameters
         _, w_logits = inn_model.extract(rendered_image)
 
         # 3. 混合 Loss
@@ -79,13 +87,9 @@ def train_watermark_frozen(opt, dataloader, gaussians):
         # --- 日志记录 ---
         with torch.no_grad():
             acc = compute_accuracy(w_logits, watermark_key)
-            # 计算 masked PSNR
             cur_psnr = psnr(rendered_image * mask, gt_image * mask).mean().double().item()
-            cur_ssim = ssim(rendered_image * mask, gt_image * mask).mean().item()
 
-            # 指标平滑更新
             ema_psnr = 0.4 * cur_psnr + 0.6 * ema_psnr
-            ema_ssim = 0.4 * cur_ssim + 0.6 * ema_ssim
             ema_acc = 0.4 * acc + 0.6 * ema_acc
             ema_loss = 0.4 * loss.item() + 0.6 * ema_loss
 
@@ -99,7 +103,8 @@ def train_watermark_frozen(opt, dataloader, gaussians):
     # 保存最终结果
     os.makedirs(opt.workspace, exist_ok=True)
     gaussians.save(opt.workspace, max_iter, "fine")
-    # 为了方便测试脚本，把 INN 权重也拷贝(或重新保存)一份到模型目录
+
+    # 拷贝 INN 和 Key 到结果目录，方便测试
     torch.save(inn_model.state_dict(), os.path.join(opt.workspace, "watermark_inn.pth"))
     torch.save(watermark_key, os.path.join(opt.workspace, "watermark_key.pth"))
     print(f"Fine-tuning complete. Model saved to {opt.workspace}")
@@ -108,13 +113,14 @@ def train_watermark_frozen(opt, dataloader, gaussians):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str, help="Dataset path")
-    parser.add_argument('--pretrained_model_path', type=str, required=True, help="Clean model path (Step 1 output)")
-    parser.add_argument('--inn_path', type=str, required=True, help="Pretrained INN path (Step 2 output)")
+    parser.add_argument('--pretrained_model_path', type=str, required=True, help="Clean model path")
+    parser.add_argument('--inn_path', type=str, required=True, help="Pretrained INN path")
     parser.add_argument('--workspace', type=str, default='output/watermarked_gs', help="Final output path")
+    parser.add_argument('--wm_len', type=int, default=64, help="Watermark length (MUST match inn_path model)")
     parser.add_argument('--watermark_iters', type=int, default=5000)
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])
 
-    # GS 默认参数 (用于初始化)
+    # GS 默认参数
     parser.add_argument('--sh_degree', type=int, default=3)
     parser.add_argument('--percent_dense', type=float, default=0.01)
     parser.add_argument('--position_lr_init', type=float, default=0.00016)

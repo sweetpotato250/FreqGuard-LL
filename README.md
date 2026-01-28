@@ -52,6 +52,13 @@ python eval_rgb.py --gt_dir data/cutting_tissues_twice/images --mask_dir data/cu
 ```
 Note: we should use the same masks in training and evaluation. If the name 'gt_masks' exist, we use 'gt_masks'; if not, use 'masks'. And we exclude the unseen pixels in gt and rendered images for PSNR.
 
+## Test
+
+python test_watermark.py data/endonerf/cutting_tissues_twice/ \
+    --model_path output/watermarked_model \
+    --output_path output/test_results \
+    --save_images
+
 ## Citation
 
 If you find our work useful, please kindly cite as (v1 version of arxiv bib to avoid tracking missing):

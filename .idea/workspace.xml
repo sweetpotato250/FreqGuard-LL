@@ -5,7 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="3a499882-345d-4061-b2c7-e75930c411e0" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/test_watermark.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/pretrain_inn.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/watermark_core.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/train_watermark.py" beforeDir="false" afterPath="$PROJECT_DIR$/train_watermark.py" afterDir="false" />
     </list>
@@ -35,13 +36,13 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "master",
-    "last_opened_file_path": "D:/learn_python/CopyRNeRF-code-main"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;last_opened_file_path&quot;: &quot;D:/learn_python/CopyRNeRF-code-main&quot;
   }
-}]]></component>
+}</component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>

@@ -66,57 +66,40 @@ def train_watermark_frozen(opt, dataloader, gaussians):
             data = next(dataloader_iter)
 
         gt_image = data['camera'].original_image.cuda().unsqueeze(0)
-
-        # 1. 获取原来的工具掩码 (1=组织, 0=工具/背景)
-        tool_mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0)
-
-        # 2. 获取病变掩码 (1=病变, 0=非病变)
-        # 注意: 之前 provider.py 里处理过，如果没有文件则全0
-        lesion_mask = data['lesion_mask'].cuda().unsqueeze(0).unsqueeze(0)
+        mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0)
 
         # =========================================================
-        # [策略核心] RONI + 腐蚀 + 混合目标
+        # [核心修改] Mask 腐蚀策略 (Erosion Strategy)
+        # =========================================================
+        # 原理：使用 MaxPool 对 Mask 取反来实现腐蚀，把有效区域向内缩
+        # kernel_size=21 表示向内缩大约 10 个像素，避开手术钳边缘的伪影
+        erosion_kernel = 21
+
+        # 1. 取反 (因为 MaxPool 是膨胀，我们需要腐蚀，所以先反过来)
+        inverted_mask = 1.0 - mask
+        # 2. 膨胀 (让非组织区域变大)
+        dilated_inverted_mask = F.max_pool2d(inverted_mask, kernel_size=erosion_kernel, stride=1,
+                                             padding=erosion_kernel // 2)
+        # 3. 再取反回来 (得到缩小了的组织 Mask)
+        eroded_mask = 1.0 - dilated_inverted_mask
+
+        # 使用腐蚀后的 Mask 作为水印嵌入的“安全区”
+        valid_mask = eroded_mask
         # =========================================================
 
-        # Step A: 定义“健康的背景组织”区域 (RONI)
-        # 逻辑：必须是组织(tool_mask=1) 并且 必须不是病变(lesion_mask=0)
-        roni_mask = tool_mask * (1.0 - lesion_mask)
-
-        # Step B: Mask 腐蚀策略 (去除边缘伪影)
-        # 对 RONI 区域进行腐蚀，避开工具边缘和病变边缘
-        erosion_kernel = 21  # 腐蚀程度
-        inverted_roni = 1.0 - roni_mask
-        # 膨胀非RONI区域 = 腐蚀RONI区域
-        dilated_inverted = F.max_pool2d(inverted_roni, kernel_size=erosion_kernel, stride=1,
-                                        padding=erosion_kernel // 2)
-        final_embed_mask = 1.0 - dilated_inverted
-
-        # --- 渲染 ---
+        # --- 渲染与 Loss 计算 ---
         gaussians.optimizer.zero_grad(set_to_none=True)
 
+        # 1. 渲染
         render_pkg = render(data['camera'], gaussians, data['time'], background, stage="fine")
         rendered_image = render_pkg["render"].unsqueeze(0)
 
-        # --- 计算混合目标 (Target) ---
-        # 1. 计算全图水印
-        wm_full = inn_model.embed(gt_image, watermark_key)
-
-        # 2. 物理拼接：
-        #    - 在 final_embed_mask 区域 (健康组织中心)：使用 水印图
-        #    - 在 其他区域 (病变、边缘、背景)：使用 原图
-        target_image = wm_full * final_embed_mask + gt_image * (1.0 - final_embed_mask)
-
-        # --- Loss 计算 ---
-
-        # 1. 重建 Loss (L1)
-        # 我们希望 Gaussian 渲染出的结果尽可能接近 target_image
-        # 只在 tool_mask 区域内计算 (即只关心组织部分，不管黑边)
-        # 此时，Gaussian 会被迫在病变区学原图，在健康区学水印
-        loss_recon = l1_loss(rendered_image * tool_mask, target_image * tool_mask)
-
-        # 2. 水印提取 Loss (BER)
-        # 提取当前渲染图的水印
+        # 2. 水印提取 (通过冻结的 INN)
         _, w_logits = inn_model.extract(rendered_image)
+
+        # 3. 混合 Loss
+        # [关键] 只有在“安全区”(valid_mask) 内，我们才要求 Gaussian 拟合水印
+        loss_recon = l1_loss(rendered_image * valid_mask, gt_image * valid_mask)
         loss_ber = compute_ber_loss(w_logits, watermark_key)
 
         loss = loss_recon + lambda_ber * loss_ber
@@ -126,8 +109,8 @@ def train_watermark_frozen(opt, dataloader, gaussians):
         # --- 日志记录 ---
         with torch.no_grad():
             acc = compute_accuracy(w_logits, watermark_key)
-            # PSNR 计算：全图(masked)计算，反映整体画质
-            cur_psnr = psnr(rendered_image * tool_mask, gt_image * tool_mask).mean().double().item()
+            # 计算 PSNR 时也只看 Mask 区域 (这里用原 Mask 或者腐蚀后的 Mask 都可以，用原 Mask 更能反映整体观感)
+            cur_psnr = psnr(rendered_image * mask, gt_image * mask).mean().double().item()
 
             ema_psnr = 0.4 * cur_psnr + 0.6 * ema_psnr
             ema_acc = 0.4 * acc + 0.6 * ema_acc

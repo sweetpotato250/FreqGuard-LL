@@ -3,6 +3,7 @@ import os
 import argparse
 from tqdm import tqdm
 import torchvision
+import numpy as np
 
 from gaussian_core.provider import EndoDataset
 from gaussian_core.utils import seed_everything
@@ -53,7 +54,13 @@ def test_watermark(opt):
     inn_model.load_state_dict(torch.load(inn_ckpt_path))
     inn_model.eval()
 
+    # 加载水印 Key (Message)
     watermark_key = torch.load(key_ckpt_path).cuda()
+
+    # [新增] 将 Key 转换为 01 字符串
+    key_bits = watermark_key[0].cpu().detach().numpy().astype(int)  # [0, 1, 1, 0, ...]
+    key_str = "".join(str(b) for b in key_bits)
+    print(f"[INFO] Watermark Message: {key_str}")
 
     # 检查长度
     if watermark_key.shape[1] != opt.wm_len:
@@ -71,6 +78,11 @@ def test_watermark(opt):
     count = 0
 
     with open(output_file, "w") as f:
+        # [新增] 在首行写入水印信息
+        f.write(f"Watermark_Message (Len={len(key_str)}): {key_str}\n")
+        f.write("=" * 80 + "\n")  # 分隔线
+
+        # 写入表头
         header = f"{'Image_ID':<15} | {'PSNR':<10} | {'SSIM':<10} | {'Accuracy':<10}\n"
         f.write(header)
         f.write("-" * 55 + "\n")

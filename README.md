@@ -25,6 +25,11 @@ We use the dataset in [EndoNeRF](https://github.com/med-air/EndoNeRF). Download 
 Use [COLMAP](https://demuc.de/colmap/) to estimate the initial point clouds. Store the files (`cameras.bin, images.bin, points3D.bin`) in the data path (e.g., `./data/cutting_tissues_twice/sparse/`).
 
 ## Training
+
+python pretrain_inn.py data/cutting_tissues_twice/ --workspace output/inn_pretrain
+
+
+
 ```
 python train.py {data path} --workspace {workspace}
 ## e.g.,
@@ -32,6 +37,7 @@ python train.py data/endonerf/cutting/ --workspace output/cutting/
 
 python train_watermark.py data/endonerf/cutting/ \
     --pretrained_model_path output/cutting/point_cloud/iteration_60000/ \
+    --inn_path output/inn_pretrain/ \
     --workspace output/cutting_watermarked/ \
     --watermark_iters 5000
 

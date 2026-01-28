@@ -176,7 +176,7 @@ def train_watermark(opt, dataloader, gaussians):
     ema_acc = 0.0
     ema_loss = 0.0
 
-    for iteration in range(iter_start, max_iter):
+    for iteration in progress_bar:
         try:
             data = next(iter(dataloader))
         except StopIteration:

@@ -6,13 +6,13 @@ import argparse
 from tqdm import tqdm
 import numpy as np
 
-# 修正导入路径，确保能找到这些模块
+# 导入必要的模块
 from gaussian_core.provider import EndoDataset
 from gaussian_core.utils import *
 from gaussian_core.gaussian_model import GaussianModel
 from gaussian_renderer import render
-# [FIX] 显式导入 l1_loss
-from utils.loss_utils import l1_loss
+from utils.loss_utils import l1_loss, ssim  # [Added] 导入 ssim
+from utils.image_utils import psnr  # [Added] 导入 psnr
 
 
 # ==========================================
@@ -25,20 +25,16 @@ class DWT(nn.Module):
 
     def forward(self, x):
         # x: [B, C, H, W]
-        # Haar Wavelet Transform
         x01 = x[:, :, 0::2, :] / 2
         x02 = x[:, :, 1::2, :] / 2
         x1 = x01[:, :, :, 0::2]
         x2 = x02[:, :, :, 0::2]
         x3 = x01[:, :, :, 1::2]
         x4 = x02[:, :, :, 1::2]
-
         x_LL = x1 + x2 + x3 + x4
         x_HL = -x1 - x2 + x3 + x4
         x_LH = -x1 + x2 - x3 + x4
         x_HH = x1 - x2 - x3 + x4
-
-        # Output: [B, 4*C, H/2, W/2]
         return torch.cat([x_LL, x_HL, x_LH, x_HH], dim=1)
 
 
@@ -49,7 +45,6 @@ class IDWT(nn.Module):
 
     def forward(self, x):
         # x: [B, 4*C, H/2, W/2]
-        # Inverse Haar Wavelet Transform
         in_batch, in_channel, in_height, in_width = x.size()
         out_channel = int(in_channel / 4)
         out_height = 2 * in_height
@@ -61,12 +56,10 @@ class IDWT(nn.Module):
         x4 = x[:, out_channel * 3:out_channel * 4, :, :] / 2
 
         h = torch.zeros([in_batch, out_channel, out_height, out_width]).float().to(x.device)
-
         h[:, :, 0::2, 0::2] = x1 - x2 - x3 + x4
         h[:, :, 1::2, 0::2] = x1 - x2 + x3 - x4
         h[:, :, 0::2, 1::2] = x1 + x2 - x3 - x4
         h[:, :, 1::2, 1::2] = x1 + x2 + x3 + x4
-
         return h
 
 
@@ -85,15 +78,12 @@ class CouplingLayer(nn.Module):
         )
 
     def forward(self, x, reverse=False):
-        # Split channels
         x1, x2 = torch.chunk(x, 2, dim=1)
         if not reverse:
-            # Forward: Additive coupling
             y1 = x1
             y2 = x2 + self.net(x1)
             return torch.cat([y1, y2], dim=1)
         else:
-            # Reverse
             y1 = x1
             y2 = x2 - self.net(x1)
             return torch.cat([y1, y2], dim=1)
@@ -101,82 +91,44 @@ class CouplingLayer(nn.Module):
 
 class WatermarkINN(nn.Module):
     def __init__(self, in_channels=12, steps=3, wm_len=64):
-        # in_channels=12 because RGB(3) * 4 subbands = 12
         super(WatermarkINN, self).__init__()
         self.dwt = DWT()
         self.idwt = IDWT()
         self.wm_len = wm_len
-
-        # INN Layers
         self.layers = nn.ModuleList([CouplingLayer(in_channels) for _ in range(steps)])
-
-        # Watermark Projection (Embedding)
         self.wm_projection = nn.Linear(wm_len, in_channels)
-
-        # Watermark Extraction Head (Decoding)
-        # Maps feature maps back to 64 bits probability logits
         self.wm_extract_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling [B, C, 1, 1]
-            nn.Flatten(),  # [B, C]
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
             nn.Linear(in_channels, 128),
             nn.ReLU(),
-            nn.Linear(128, wm_len)  # Output logits
+            nn.Linear(128, wm_len)
         )
 
     def embed(self, image, watermark):
-        """
-        Embed watermark into image.
-        Returns: Watermarked Image (Spatial Domain)
-        """
-        # 1. DWT: [B, 3, H, W] -> [B, 12, H/2, W/2]
         coeffs = self.dwt(image)
-
-        # 2. Add Watermark Trigger to coefficients
-        wm_feat = self.wm_projection(watermark).unsqueeze(-1).unsqueeze(-1)  # [B, 12, 1, 1]
+        wm_feat = self.wm_projection(watermark).unsqueeze(-1).unsqueeze(-1)
         x = coeffs + wm_feat
-
-        # 3. INN Forward (Mixing)
         for layer in self.layers:
             x = layer(x, reverse=False)
-
-        # 4. IDWT: [B, 12, H/2, W/2] -> [B, 3, H, W]
         watermarked_image = self.idwt(x)
         return watermarked_image
 
     def extract(self, watermarked_image):
-        """
-        Extract watermark and restore image.
-        Returns: Restored Image, Predicted Watermark Logits
-        """
-        # 1. DWT
         coeffs = self.dwt(watermarked_image)
-
-        # 2. INN Reverse
         x = coeffs
         for layer in reversed(self.layers):
             x = layer(x, reverse=True)
-
-        # 3. Extract Watermark (Predict logits) from the reversed features
         w_pred_logits = self.wm_extract_head(x)
-
-        # 4. Restore Image (IDWT of reversed features)
         restored_image = self.idwt(x)
-
         return restored_image, w_pred_logits
 
 
 def compute_ber_loss(w_pred_logits, w_gt):
-    """
-    Compute differentiable Bit Error Rate loss (BCEWithLogits).
-    """
-    # w_gt is 0 or 1, w_pred_logits is real number
     return F.binary_cross_entropy_with_logits(w_pred_logits, w_gt)
 
 
 def compute_accuracy(w_pred_logits, w_gt):
-    """
-    Compute exact bit match accuracy (0.0 to 1.0).
-    """
     w_pred_bits = (torch.sigmoid(w_pred_logits) > 0.5).float()
     correct_bits = (w_pred_bits == w_gt).float()
     return correct_bits.mean().item()
@@ -192,19 +144,18 @@ def train_watermark(opt, dataloader, gaussians):
         raise FileNotFoundError(f"point_cloud.ply not found in {opt.pretrained_model_path}")
 
     gaussians.load_ply(os.path.join(opt.pretrained_model_path, "point_cloud.ply"))
-    gaussians.load_model(opt.pretrained_model_path)  # Load deformation
+    gaussians.load_model(opt.pretrained_model_path)
 
     # 2. Setup Watermark Model
     inn_model = WatermarkINN().cuda()
     optimizer_inn = torch.optim.Adam(inn_model.parameters(), lr=1e-4)
 
-    # 3. Setup Gaussian Optimizer (Smaller LR for fine-tuning)
+    # 3. Setup Gaussian Optimizer
     gaussians.training_setup()
     for param_group in gaussians.optimizer.param_groups:
-        param_group['lr'] *= 0.1  # Reduce LR to preserve visual quality
+        param_group['lr'] *= 0.1
 
-    # 4. Define Watermark (Fixed for the model copyright)
-    # 64-bit random key (0 or 1)
+        # 4. Define Watermark Key
     watermark_key = torch.randint(0, 2, (1, 64)).float().cuda()
     print(f"Generated Watermark Key: {watermark_key[0, :10]}... (first 10 bits)")
 
@@ -212,95 +163,91 @@ def train_watermark(opt, dataloader, gaussians):
     max_iter = opt.watermark_iters
     progress_bar = tqdm(range(iter_start, max_iter), desc="Watermark Fine-tuning")
 
-    bg_color = [0, 0, 0]  # Black background
+    bg_color = [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     # Hyperparameters
-    lambda_ber = 0.5  # Weight for BER loss to constrain SH/Opacity
-    lambda_w_rec = 1.0  # Weight for Watermark reconstruction in INN training
+    lambda_ber = 0.5
+    lambda_w_rec = 1.0
+
+    # 用于平滑日志显示的 EMA (Exponential Moving Average)
+    ema_psnr = 0.0
+    ema_ssim = 0.0
+    ema_acc = 0.0
+    ema_loss = 0.0
 
     for iteration in range(iter_start, max_iter):
-        # --- Data Loading ---
         try:
             data = next(iter(dataloader))
         except StopIteration:
             dataloader_iter = iter(dataloader)
             data = next(dataloader_iter)
 
-        gt_image = data['camera'].original_image.cuda().unsqueeze(0)  # [1, 3, H, W]
-        mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W] (1=Tissue)
-
+        gt_image = data['camera'].original_image.cuda().unsqueeze(0)
+        mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0)
         valid_mask = mask
 
-        # ==========================================
-        # Step A: Train INN (The "Teacher")
-        # ==========================================
-        # Goal: Train INN to embed W into GT invisibly and extract it accurately
+        # --- Step A: INN Update ---
         optimizer_inn.zero_grad()
-
-        # Embed
         wm_image = inn_model.embed(gt_image, watermark_key)
-
-        # Extract
         restored_image, w_pred_logits = inn_model.extract(wm_image)
 
-        # Loss 1: Imperceptibility (Watermarked vs GT)
-        # We only care about visual quality in the valid tissue area
         loss_imperceptibility = l1_loss(wm_image * valid_mask, gt_image * valid_mask)
-
-        # Loss 2: Watermark Extraction (BCE)
         loss_w_extract = compute_ber_loss(w_pred_logits, watermark_key)
 
-        # Total INN Loss
         loss_inn = loss_imperceptibility + lambda_w_rec * loss_w_extract
         loss_inn.backward()
         optimizer_inn.step()
 
-        # ==========================================
-        # Step B: Fine-tune Gaussians (The "Student")
-        # ==========================================
-        # Goal: Force Gaussians (SH, Opacity, etc.) to render an image that contains the watermark code
-
+        # --- Step B: Gaussian Update ---
         gaussians.optimizer.zero_grad(set_to_none=True)
-
-        # Render current view
-        # Gradients will flow from render -> SH/Opacity
         render_pkg = render(data['camera'], gaussians, data['time'], background, stage="fine")
         rendered_image = render_pkg["render"].unsqueeze(0)
 
-        # Calculate BER on Rendered Image using the (frozen) INN
-        # We DO NOT update INN here, but we need gradients to flow through INN to the rendered_image
-        w_pred_logits_render = inn_model.extract(rendered_image)[1]  # Get logits only
+        w_pred_logits_render = inn_model.extract(rendered_image)[1]
 
-        # Loss 1: Reconstruction (Visual) -> Match the Watermarked GT (Teacher's output)
-        # This helps the Gaussian approximate the watermarked texture
-        target_image = wm_image.detach()  # Stop gradients to INN
+        target_image = wm_image.detach()
         loss_recon = l1_loss(rendered_image * valid_mask, target_image * valid_mask)
-
-        # Loss 2: BER Constraint (The critical part for protection)
-        # Force the rendered image to be decodable
         loss_ber_gs = compute_ber_loss(w_pred_logits_render, watermark_key)
 
-        # Total Gaussian Loss
+        # 总损失
         loss_gs = loss_recon + lambda_ber * loss_ber_gs
 
         loss_gs.backward()
         gaussians.optimizer.step()
 
-        # --- Metrics & Logging ---
+        # --- Metrics Calculation ---
         with torch.no_grad():
-            # Check accuracy on the rendered image
-            acc_w = compute_accuracy(w_pred_logits_render, watermark_key)
+            # 1. Accuracy
+            current_acc = compute_accuracy(w_pred_logits_render, watermark_key)
+
+            # 2. PSNR & SSIM (Rendered vs Original GT) - 反映画质影响
+            # 限制在有效区域或全图计算均可，这里计算 mask 区域更有意义，但标准库通常计算全图。
+            # 简单起见，我们计算 masked 后的图像指标，或者直接计算全图。
+            # 为了反映真实感知，计算 masked 区域的 PSNR 会更准确地反映组织变化。
+            # 这里简单做：(Render * Mask) vs (GT * Mask)
+
+            masked_render = rendered_image * valid_mask
+            masked_gt = gt_image * valid_mask
+
+            current_psnr = psnr(masked_render, masked_gt).mean().double().item()
+            current_ssim = ssim(masked_render, masked_gt).mean().item()
+
+            # EMA Updates
+            ema_psnr = 0.4 * current_psnr + 0.6 * ema_psnr
+            ema_ssim = 0.4 * current_ssim + 0.6 * ema_ssim
+            ema_acc = 0.4 * current_acc + 0.6 * ema_acc
+            ema_loss = 0.4 * loss_gs.item() + 0.6 * ema_loss
 
         if iteration % 10 == 0:
             progress_bar.set_postfix({
-                "INN_L": f"{loss_inn.item():.4f}",
-                "Rec_L": f"{loss_recon.item():.4f}",
-                "BER_L": f"{loss_ber_gs.item():.4f}",
-                "Acc_W": f"{acc_w * 100:.1f}%"
+                "PSNR": f"{ema_psnr:.2f}",
+                "SSIM": f"{ema_ssim:.4f}",
+                "Acc": f"{ema_acc:.4f}",
+                "Loss": f"{ema_loss:.5f}"
             })
 
-    # Save Final Watermarked Model
+    # Save
     if opt.workspace is not None:
         os.makedirs(opt.workspace, exist_ok=True)
 
@@ -315,12 +262,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str, help="Path to dataset")
     parser.add_argument('--pretrained_model_path', type=str, required=True,
-                        help="Path to clean pretrained model directory (containing point_cloud.ply)")
+                        help="Path to clean pretrained model directory")
     parser.add_argument('--workspace', type=str, default='output/watermarked_model', help="Where to save result")
     parser.add_argument('--watermark_iters', type=int, default=5000, help="Number of fine-tuning iterations")
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])
 
-    # Gaussian params (Default values for initialization)
+    # Gaussian params
     parser.add_argument('--sh_degree', type=int, default=3)
     parser.add_argument('--percent_dense', type=float, default=0.01)
     parser.add_argument('--position_lr_init', type=float, default=0.00016)

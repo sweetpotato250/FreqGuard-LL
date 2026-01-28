@@ -29,6 +29,12 @@ Use [COLMAP](https://demuc.de/colmap/) to estimate the initial point clouds. Sto
 python train.py {data path} --workspace {workspace}
 ## e.g.,
 python train.py data/cutting_tissues_twice/ --workspace output/cutting/
+
+python train_watermark.py data/cutting_tissues_twice/ \
+    --pretrained_model_path output/cutting_clean/point_cloud/iteration_60000/ \
+    --workspace output/cutting_watermarked/ \
+    --watermark_iters 5000
+
 ```
 
 ## Inference

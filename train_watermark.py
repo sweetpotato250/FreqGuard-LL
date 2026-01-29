@@ -277,12 +277,9 @@ def train_watermark(opt, dataloader, gaussians):
         # 嵌入 Mask 生成
         # ======================================================================
 
-        # Step 1: 获得安全区域 (既不是器械，也不是病变)
-        tissue_mask = 1.0 - tool_mask  # 1=Tissue
-        healthy_mask = 1.0 - lesion_mask  # 1=Healthy
 
         # roni_mask: 1 = 嵌入区, 0 = 保持区
-        roni_mask = tissue_mask * healthy_mask
+        roni_mask = tool_mask * lesion_mask
 
         # --- 腐蚀操作 (收缩嵌入区域) ---
         erosion_kernel = 21

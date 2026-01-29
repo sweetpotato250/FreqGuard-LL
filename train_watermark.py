@@ -152,6 +152,10 @@ def warmup_inn(inn_model, dataloader, watermark_key, epochs=30):
 
             # Forward
             wm_image = inn_model.embed(gt_image, watermark_key)
+
+            # [Safety] Clamp output
+            wm_image = torch.clamp(wm_image, 0.0, 1.0)
+
             _, w_logits = inn_model.extract(wm_image)
 
             # Loss
@@ -202,22 +206,29 @@ def train_watermark(opt, dataloader, gaussians):
     gaussians.training_setup()
 
     # ==========================================================================
-    # [逻辑保留] 冻结几何参数 (xyz, rotation, scaling)
+    # [修改] 白名单模式 (Hot Params): 只微调 SH，冻结其他一切
     # ==========================================================================
-    print("Configuring Optimizer: Freezing xyz, rotation, scaling...")
+    print("Configuring Optimizer: Only SH (f_dc, f_rest) are HOT. Freezing others...")
 
-    freeze_params = ['xyz', 'rotation', 'scaling']
+    # 定义允许更新的参数 (SH 参数)
+    hot_params = ['f_dc', 'f_rest']
 
     for param_group in gaussians.optimizer.param_groups:
         name = param_group['name']
-        if name in freeze_params:
+
+        if name in hot_params:
+            # 激活状态：SH 参数
+            # 保持微调的学习率策略 (例如 0.5 倍)
+            param_group['lr'] *= 0.5
+            for param in param_group['params']:
+                param.requires_grad = True
+            print(f"  -> [HOT] Active parameter: {name}")
+        else:
+            # 冻结状态：xyz, rotation, scaling, opacity 等
             param_group['lr'] = 0.0
             for param in param_group['params']:
                 param.requires_grad = False
-            print(f"  -> Frozen parameter group: {name}")
-        else:
-            param_group['lr'] *= 0.5
-            print(f"  -> Active parameter group: {name} (LR scaled by 0.5)")
+            print(f"  -> [FROZEN] Parameter: {name}")
     # ==========================================================================
 
     bg_color = [0, 0, 0]
@@ -243,40 +254,43 @@ def train_watermark(opt, dataloader, gaussians):
         B, C, H, W = gt_image.shape
 
         # ======================================================================
-        # [严谨修复] 统一 Mask 尺寸，防止 500 vs 512 报错
+        # Mask 处理逻辑 (保留正确的逻辑)
         # ======================================================================
 
-        # 1. 处理 Tool Mask
+        # 1. 处理 Tool Mask (原始值: 1=器械, 0=生物组织)
         tool_mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0).float()
-        # 如果尺寸不匹配，强制插值对齐
         if tool_mask.shape[2] != H or tool_mask.shape[3] != W:
             tool_mask = F.interpolate(tool_mask, size=(H, W), mode='nearest')
 
-        # 2. 处理 Lesion Mask
+        # 2. 处理 Lesion Mask (原始值: 1=病变, 0=健康)
         if 'lesion_mask' in data:
             lesion_mask = data['lesion_mask'].cuda().unsqueeze(0).unsqueeze(0).float()
-            # 如果尺寸不匹配，强制插值对齐
             if lesion_mask.shape[2] != H or lesion_mask.shape[3] != W:
                 lesion_mask = F.interpolate(lesion_mask, size=(H, W), mode='nearest')
         else:
-            # 缺失时告警并创建全 1 Mask
             if not warned_missing_mask and iteration == 0:
-                print(f"\n[WARNING] 'lesion_mask' not found! Fallback to ONES with shape ({H}, {W}).")
+                print(f"\n[WARNING] 'lesion_mask' not found! Fallback to ZEROS (Assuming NO lesions).")
                 warned_missing_mask = True
-            lesion_mask = torch.ones_like(tool_mask)
+            lesion_mask = torch.zeros_like(tool_mask)
 
         # ======================================================================
+        # 嵌入 Mask 生成
+        # ======================================================================
 
-        # --- 定义 RONI (非病变区域) ---
-        # 此时 roni_mask 尺寸保证是 [1, 1, H, W]
-        roni_mask = tool_mask * lesion_mask
+        # Step 1: 获得安全区域 (既不是器械，也不是病变)
+        tissue_mask = 1.0 - tool_mask  # 1=Tissue
+        healthy_mask = 1.0 - lesion_mask  # 1=Healthy
 
-        # --- 腐蚀操作 (去除边缘伪影) ---
+        # roni_mask: 1 = 嵌入区, 0 = 保持区
+        roni_mask = tissue_mask * healthy_mask
+
+        # --- 腐蚀操作 (收缩嵌入区域) ---
         erosion_kernel = 21
         inverted_roni = 1.0 - roni_mask
         dilated_inverted = F.max_pool2d(inverted_roni, kernel_size=erosion_kernel, stride=1,
                                         padding=erosion_kernel // 2)
-        final_embed_mask = 1.0 - dilated_inverted
+
+        final_embed_mask = 1.0 - dilated_inverted  # 1=Embed Here, 0=Keep GT
 
         # --- 渲染 ---
         gaussians.optimizer.zero_grad(set_to_none=True)
@@ -285,14 +299,17 @@ def train_watermark(opt, dataloader, gaussians):
 
         # --- 构造目标图像 ---
         with torch.no_grad():
-            wm_full = inn_model.embed(gt_image, watermark_key)
+            wm_raw = inn_model.embed(gt_image, watermark_key)
+            # [Safety] 截断防止溢出
+            wm_full = torch.clamp(wm_raw, 0.0, 1.0)
 
-        # 物理拼接: 只在最终掩码区用水印图
-        # 由于我们前面保证了 Mask 尺寸与 gt_image 一致，这里不会报错
+        # 物理拼接
         target_image = wm_full * final_embed_mask + gt_image * (1.0 - final_embed_mask)
 
         # --- Loss ---
-        loss_recon = l1_loss(rendered_image * tool_mask, target_image * tool_mask)
+        # 全图 Loss，确保边缘高斯点也能正确学习
+        loss_recon = l1_loss(rendered_image, target_image)
+
         _, w_logits = inn_model.extract(rendered_image)
         loss_ber = compute_ber_loss(w_logits, watermark_key)
 
@@ -303,7 +320,7 @@ def train_watermark(opt, dataloader, gaussians):
         # --- Logging ---
         with torch.no_grad():
             acc = compute_accuracy(w_logits, watermark_key)
-            cur_psnr = psnr(rendered_image * tool_mask, gt_image * tool_mask).mean().double().item()
+            cur_psnr = psnr(rendered_image, gt_image).mean().double().item()
 
             ema_psnr = 0.4 * cur_psnr + 0.6 * ema_psnr
             ema_acc = 0.4 * acc + 0.6 * ema_acc
@@ -317,7 +334,7 @@ def train_watermark(opt, dataloader, gaussians):
             })
 
     # ==========================================================================
-    # [逻辑保留] 保存到 iteration 文件夹
+    # 保存结果
     # ==========================================================================
     print(f"\nSaving final models...")
 

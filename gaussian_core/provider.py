@@ -2,6 +2,7 @@ import os
 import tqdm
 import imageio
 import numpy as np
+import cv2
 
 import torch
 from torch.utils.data import DataLoader
@@ -64,7 +65,6 @@ def _minify(basedir, factors=[], dir_name='images', resolutions=[]):
 
 
 def _preprocess_imgs(basedir, dir_name='images', factor=None, width=None, height=None, check_fn=lambda x: True):
-    # Ensure directory exists before listing
     target_dir = os.path.join(basedir, dir_name)
     if not os.path.exists(target_dir):
         return None, None
@@ -143,7 +143,10 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, fg
             return imageio.imread(f)
 
     rgb_imgs = [imread(f)[..., :3] / 255. for f in rgb_files]
-    rgb_imgs = np.stack(rgb_imgs, -1)
+    rgb_imgs = np.stack(rgb_imgs, -1)  # Shape: (H, W, 3, N)
+
+    # Get target dimensions from loaded images (for safety check)
+    target_h, target_w = rgb_imgs.shape[0], rgb_imgs.shape[1]
 
     mask_imgs = None
     if fg_mask:
@@ -160,13 +163,15 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, fg
 
         mask_imgs = [imread(f) / 255.0 for f in mask_files]
 
-        if mask_imgs[0].shape[:2] != rgb_imgs[..., 0].shape[:2]:
-            print('Mismatch size between rgb imgs {} and mask imgs {} !!!!'.format(rgb_imgs[..., 0].shape[:2],
+        if mask_imgs[0].shape[:2] != (target_h, target_w):
+            print('Mismatch size between rgb imgs {} and mask imgs {} !!!!'.format((target_h, target_w),
                                                                                    mask_imgs[0].shape[:2]))
             return
 
         mask_imgs = np.stack(mask_imgs, -1)
-        # Convert 0 for tool, 1 for not tool
+        # [Tool Mask Logic]
+        # Input: 1=Tool, 0=Tissue
+        # Convert to: 0=Tool, 1=Tissue (Non-Tool)
         mask_imgs = 1.0 - mask_imgs
 
     depth_imgs = None
@@ -180,55 +185,58 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, fg
 
         depth_imgs = [imread(f) for f in depth_files]
 
-        if depth_imgs[0].shape[:2] != rgb_imgs[..., 0].shape[:2]:
-            print('Mismatch size between rgb imgs {} and depth imgs {} !!!!'.format(rgb_imgs[..., 0].shape[:2],
+        if depth_imgs[0].shape[:2] != (target_h, target_w):
+            print('Mismatch size between rgb imgs {} and depth imgs {} !!!!'.format((target_h, target_w),
                                                                                     depth_imgs[0].shape[:2]))
             return
 
         depth_imgs = np.stack(depth_imgs, -1)
 
-    # [Added] Lesion Masks Loading
+    # [Lesion Mask Logic]
+    # Input (PraNet): 1=Lesion, 0=Non-Lesion
+    # Target: 0=Lesion, 1=Non-Lesion
     lesion_imgs = None
     lesion_files, _ = _preprocess_imgs(basedir, dir_name='lesion_masks', factor=factor, width=width, height=height,
                                        check_fn=check_lesionimg_fn)
 
     if lesion_files is not None and len(lesion_files) == len(rgb_files):
-        print(f"Found {len(lesion_files)} lesion masks.")
-        lesion_imgs = [imread(f) / 255.0 for f in lesion_files]
+        print(f"Found {len(lesion_files)} lesion masks. Processing...")
+        processed_masks = []
+        for f in lesion_files:
+            m = imread(f)
+            if m.max() > 1.0: m = m / 255.0
 
-        # Ensure single channel (if saved as RGB, take one channel)
-        if len(lesion_imgs[0].shape) == 3:
-            lesion_imgs = [m[..., 0] for m in lesion_imgs]
+            if len(m.shape) == 3:
+                m = m[..., 0]
 
-        if lesion_imgs[0].shape[:2] != rgb_imgs[..., 0].shape[:2]:
-            print('Mismatch size between rgb imgs {} and lesion imgs {} !!!!'.format(rgb_imgs[..., 0].shape[:2],
-                                                                                     lesion_imgs[0].shape[:2]))
-            # If size mismatch, fallback to None or handle resize (but preprocess should handle factor)
-            lesion_imgs = None
-        else:
-            lesion_imgs = np.stack(lesion_imgs, -1)
-            # Threshold to ensure binary (PraNet output > 0.5 is lesion)
-            lesion_imgs = (lesion_imgs > 0.5).astype(np.float32)
+            # Safety resize (optional, kept for robustness)
+            if m.shape[0] != target_h or m.shape[1] != target_w:
+                m = cv2.resize(m, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+            processed_masks.append(m)
+
+        lesion_imgs = np.stack(processed_masks, -1)  # (H, W, N)
+        # Threshold: 1=Lesion
+        lesion_imgs = (lesion_imgs > 0.5).astype(np.float32)
+        # Invert: 0=Lesion, 1=Non-Lesion (Background)
+        lesion_imgs = 1.0 - lesion_imgs
     else:
-        print("Lesion masks not found or count mismatch. Using zeros.")
-        lesion_imgs = np.zeros_like(rgb_imgs[..., 0])  # [H, W, N] of zeros
-        lesion_imgs = np.stack([lesion_imgs], -1) if len(lesion_imgs.shape) == 2 else lesion_imgs
+        print("Lesion masks not found. Using ONES (Assuming all is Non-Lesion).")
+        # Fallback: All ones means "No lesion present", all areas are safe 1
+        H, W, _, N = rgb_imgs.shape
+        lesion_imgs = np.ones((H, W, N), dtype=np.float32)
 
-    rgb_imgs = rgb_imgs[:500]
-    mask_imgs = mask_imgs[:500]
-    depth_imgs = depth_imgs[:500]
-    if lesion_imgs.shape[-1] > 500:
-        lesion_imgs = lesion_imgs[:500]
+    # [Fixed Slice Logic] Slice the LAST dimension (N)
+    rgb_imgs = rgb_imgs[..., :500]
+    mask_imgs = mask_imgs[..., :500]
+    depth_imgs = depth_imgs[..., :500]
+    lesion_imgs = lesion_imgs[..., :500]
 
-    # Ensure dimensions match after slicing
-    if lesion_imgs.shape[-1] != rgb_imgs.shape[-1]:
-        # Handle case where lesion_imgs was created as zeros but slicing logic differed
-        padding = rgb_imgs.shape[-1] - lesion_imgs.shape[-1]
-        if padding > 0:
-            zeros = np.zeros_like(lesion_imgs[..., :1]).repeat(padding, axis=-1)
-            lesion_imgs = np.concatenate([lesion_imgs, zeros], axis=-1)
-        else:
-            lesion_imgs = lesion_imgs[..., :rgb_imgs.shape[-1]]
+    # Final dimension check
+    target_N = rgb_imgs.shape[-1]
+    if lesion_imgs.shape[-1] != target_N:
+        H, W, _, _ = rgb_imgs.shape
+        lesion_imgs = np.ones((H, W, target_N), dtype=np.float32)
 
     print('Loaded image data', rgb_imgs.shape, poses[:, -1, 0])
     return poses, bds, rgb_imgs, mask_imgs, depth_imgs, lesion_imgs
@@ -297,17 +305,18 @@ class EndoDataset:
         else:
             gt_mask = True
 
-        # [Modified] receive lesion_masks
         poses, _, imgs, masks, depth, lesion_masks = _load_data(self.root_path, factor=None, fg_mask=True,
                                                                 use_depth=True, gt_mask=gt_mask)
 
         davinci_endoscopic = True
         if not davinci_endoscopic:
             poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
+
         poses = np.moveaxis(poses, -1, 0).astype(np.float32)
         images = np.moveaxis(imgs, -1, 0).astype(np.float32)
         masks = np.moveaxis(masks, -1, 0).astype(np.float32)
         depth = np.moveaxis(depth, -1, 0).astype(np.float32)
+        # Move axis for lesion_masks
         lesion_masks = np.moveaxis(lesion_masks, -1, 0).astype(np.float32)
 
         recenter = True
@@ -414,8 +423,13 @@ class EndoDataset:
 
         results['mask'] = self.masks[index[0]]
         results['depth'] = self.depth[index[0]]
-        # [Added] Return lesion mask
-        results['lesion_mask'] = self.lesion_masks[index[0]]
+
+        # Safe access to lesion_mask
+        if len(self.lesion_masks) > index[0]:
+            results['lesion_mask'] = self.lesion_masks[index[0]]
+        else:
+            # Fallback: ones (all safe)
+            results['lesion_mask'] = torch.ones_like(self.masks[index[0]])
 
         results['spatialweight'] = self.spatialweight[index[0]]
 

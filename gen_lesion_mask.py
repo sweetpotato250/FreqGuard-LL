@@ -68,7 +68,7 @@ def generate_masks(model_path, data_path, save_path):
 
 if __name__ == '__main__':
     # 修改这里的路径
-    dataset_root = "data/cutting_tissues_twice"  # 你的 EndoGS 数据集路径
+    dataset_root = "../data/endonerf/cutting_tissues_twice"  # 你的 EndoGS 数据集路径
     model_ckpt = "snapshots/PraNet_Res2Net.pth"  # 你下载的权重路径
     output_folder = os.path.join(dataset_root, "lesion_masks")  # 输出文件夹
 

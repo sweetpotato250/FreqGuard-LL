@@ -4,7 +4,8 @@ import argparse
 from tqdm import tqdm
 import torchvision
 import numpy as np
-import imageio  # [新增] 用于生成视频
+import imageio
+import lpips
 
 from gaussian_core.provider import EndoDataset
 from gaussian_core.utils import seed_everything
@@ -36,13 +37,13 @@ def test_watermark(opt):
         output_dir = model_path
     os.makedirs(output_dir, exist_ok=True)
 
-    # 路径设置
+    # 路径设置 (无条件创建)
     render_dir = os.path.join(output_dir, "renders")
     gt_dir = os.path.join(output_dir, "gt")
 
-    if opt.save_images:
-        os.makedirs(render_dir, exist_ok=True)
-        os.makedirs(gt_dir, exist_ok=True)
+    print(f"[INFO] Creating output directories...")
+    os.makedirs(render_dir, exist_ok=True)
+    os.makedirs(gt_dir, exist_ok=True)
 
     print(f"[INFO] Loading Watermarked Gaussians from: {model_path}")
     print(f"[INFO] Watermark Length: {opt.wm_len}")
@@ -68,6 +69,10 @@ def test_watermark(opt):
     inn_model.load_state_dict(torch.load(inn_ckpt_path))
     inn_model.eval()
 
+    # 3. 初始化 LPIPS 模型
+    print(f"[INFO] Initializing LPIPS metric (net='alex')...")
+    loss_fn_lpips = lpips.LPIPS(net='alex').cuda()
+
     # 加载水印 Key
     watermark_key = torch.load(key_ckpt_path).cuda()
     key_bits = watermark_key[0].cpu().detach().numpy().astype(int)
@@ -78,30 +83,28 @@ def test_watermark(opt):
         print(
             f"[WARNING] Loaded key length ({watermark_key.shape[1]}) != --wm_len ({opt.wm_len}). Using loaded key length.")
 
-    # 3. 准备数据
+    # 4. 准备数据
     device = torch.device('cuda')
     dataset = EndoDataset(opt, device=device, type='test')
     dataloader = dataset.dataloader()
 
     output_file = os.path.join(output_dir, "test_metrics_report.txt")
 
-    total_psnr, total_ssim, total_acc = 0.0, 0.0, 0.0
+    total_psnr, total_ssim, total_lpips, total_acc = 0.0, 0.0, 0.0, 0.0
     count = 0
 
-    # [新增] 视频写入器初始化
-    video_writer = None
-    if opt.save_video:
-        video_path = os.path.join(output_dir, "render_video.mp4")
-        print(f"[INFO] Video recording enabled. Saving to: {video_path}")
-        # macro_block_size=1 避免有些播放器因为分辨率不能被16整除而报错
-        video_writer = imageio.get_writer(video_path, fps=opt.fps, macro_block_size=1)
+    # 视频写入器初始化 (无条件开启)
+    video_path = os.path.join(output_dir, "render_video.mp4")
+    print(f"[INFO] Video recording enabled. Saving to: {video_path} (FPS={opt.fps})")
+    # macro_block_size=1 防止分辨率对齐报错
+    video_writer = imageio.get_writer(video_path, fps=opt.fps, macro_block_size=1)
 
     with open(output_file, "w") as f:
         f.write(f"Watermark_Message (Len={len(key_str)}): {key_str}\n")
-        f.write("=" * 80 + "\n")
-        header = f"{'Image_ID':<15} | {'PSNR':<10} | {'SSIM':<10} | {'Accuracy':<10}\n"
+        f.write("=" * 100 + "\n")
+        header = f"{'Image_ID':<15} | {'PSNR':<10} | {'SSIM':<10} | {'LPIPS':<10} | {'Accuracy':<10}\n"
         f.write(header)
-        f.write("-" * 55 + "\n")
+        f.write("-" * 70 + "\n")
 
         with torch.no_grad():
             for i, data in enumerate(tqdm(dataloader, desc="Testing")):
@@ -115,16 +118,25 @@ def test_watermark(opt):
                 # Extract
                 _, w_logits = inn_model.extract(rendered_image)
 
-                # Metrics
+                # --- Metrics Calculation ---
                 masked_render = rendered_image * mask
                 masked_gt = gt_image * mask
 
+                # 1. PSNR & SSIM
                 cur_psnr = psnr(masked_render, masked_gt).mean().double().item()
                 cur_ssim = ssim(masked_render, masked_gt).mean().item()
+
+                # 2. LPIPS ([-1, 1] range)
+                lpips_in_render = torch.clamp(masked_render, 0, 1) * 2.0 - 1.0
+                lpips_in_gt = torch.clamp(masked_gt, 0, 1) * 2.0 - 1.0
+                cur_lpips = loss_fn_lpips(lpips_in_render, lpips_in_gt).mean().item()
+
+                # 3. Accuracy
                 cur_acc = compute_accuracy(w_logits, watermark_key)
 
                 total_psnr += cur_psnr
                 total_ssim += cur_ssim
+                total_lpips += cur_lpips
                 total_acc += cur_acc
                 count += 1
 
@@ -132,34 +144,32 @@ def test_watermark(opt):
                 if hasattr(data['camera'], 'image_name'):
                     image_id = data['camera'].image_name
 
-                # 保存单帧图片
-                if opt.save_images:
-                    torchvision.utils.save_image(rendered_image, os.path.join(render_dir, f"{image_id}.png"))
-                    torchvision.utils.save_image(gt_image, os.path.join(gt_dir, f"{image_id}.png"))
+                # [自动] 保存单帧图片
+                torchvision.utils.save_image(rendered_image, os.path.join(render_dir, f"{image_id}.png"))
+                torchvision.utils.save_image(gt_image, os.path.join(gt_dir, f"{image_id}.png"))
 
-                # [新增] 写入视频帧
-                if video_writer is not None:
-                    # 转换 Tensor 为 Numpy 图片
-                    frame_uint8 = tensor2numpy(rendered_image)
-                    video_writer.append_data(frame_uint8)
+                # [自动] 写入视频帧
+                frame_uint8 = tensor2numpy(rendered_image)
+                video_writer.append_data(frame_uint8)
 
-                f.write(f"{image_id:<15} | {cur_psnr:<10.4f} | {cur_ssim:<10.4f} | {cur_acc:<10.4f}\n")
+                f.write(
+                    f"{image_id:<15} | {cur_psnr:<10.4f} | {cur_ssim:<10.4f} | {cur_lpips:<10.4f} | {cur_acc:<10.4f}\n")
 
-        f.write("-" * 55 + "\n")
+        f.write("-" * 70 + "\n")
         avg_psnr = total_psnr / count
         avg_ssim = total_ssim / count
+        avg_lpips = total_lpips / count
         avg_acc = total_acc / count
-        f.write(f"{'AVERAGE':<15} | {avg_psnr:<10.4f} | {avg_ssim:<10.4f} | {avg_acc:<10.4f}\n")
+        f.write(f"{'AVERAGE':<15} | {avg_psnr:<10.4f} | {avg_ssim:<10.4f} | {avg_lpips:<10.4f} | {avg_acc:<10.4f}\n")
 
-    # [新增] 关闭视频流
-    if video_writer is not None:
-        video_writer.close()
-        print(f"[DONE] Video saved to: {video_path}")
+    # 关闭视频流
+    video_writer.close()
+    print(f"[DONE] Video saved to: {video_path}")
 
-    print(f"\n[DONE] Avg PSNR: {avg_psnr:.4f} | Avg SSIM: {avg_ssim:.4f} | Avg Acc: {avg_acc * 100:.2f}%")
+    print(
+        f"\n[DONE] Avg PSNR: {avg_psnr:.4f} | Avg SSIM: {avg_ssim:.4f} | Avg LPIPS: {avg_lpips:.4f} | Avg Acc: {avg_acc * 100:.2f}%")
     print(f"Report saved to: {output_file}")
-    if opt.save_images:
-        print(f"Images saved to: {render_dir} and {gt_dir}")
+    print(f"Images saved to: {render_dir} and {gt_dir}")
 
 
 if __name__ == '__main__':
@@ -168,10 +178,8 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, required=True, help="Watermarked model path")
     parser.add_argument('--output_path', type=str, default=None, help="Output path")
 
-    # [修改] 增加视频相关参数
-    parser.add_argument('--save_images', action='store_true', help="Save individual frames as png")
-    parser.add_argument('--save_video', action='store_true', help="Save rendered video (mp4)")
-    parser.add_argument('--fps', type=int, default=30, help="Video FPS")
+    # [修改] 默认 fps 为 24
+    parser.add_argument('--fps', type=int, default=24, help="Video FPS (default: 24)")
 
     parser.add_argument('--wm_len', type=int, default=64, help="Watermark length (default: 64)")
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])

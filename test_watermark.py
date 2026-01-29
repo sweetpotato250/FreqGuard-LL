@@ -13,6 +13,7 @@ from utils.loss_utils import ssim
 from utils.image_utils import psnr
 
 # 导入核心模块
+# 确保你有 watermark_core.py 或者根据之前的训练代码将类定义放在这里
 from watermark_core import WatermarkINN, compute_accuracy
 
 
@@ -26,9 +27,13 @@ def test_watermark(opt):
         output_dir = model_path
     os.makedirs(output_dir, exist_ok=True)
 
+    # [修改点 1] 定义 render 和 gt 文件夹路径
     render_dir = os.path.join(output_dir, "renders")
+    gt_dir = os.path.join(output_dir, "gt")
+
     if opt.save_images:
         os.makedirs(render_dir, exist_ok=True)
+        os.makedirs(gt_dir, exist_ok=True)  # 创建 gt 文件夹
 
     print(f"[INFO] Loading Watermarked Gaussians from: {model_path}")
     print(f"[INFO] Watermark Length: {opt.wm_len}")
@@ -57,8 +62,8 @@ def test_watermark(opt):
     # 加载水印 Key (Message)
     watermark_key = torch.load(key_ckpt_path).cuda()
 
-    # [新增] 将 Key 转换为 01 字符串
-    key_bits = watermark_key[0].cpu().detach().numpy().astype(int)  # [0, 1, 1, 0, ...]
+    # 将 Key 转换为 01 字符串
+    key_bits = watermark_key[0].cpu().detach().numpy().astype(int)
     key_str = "".join(str(b) for b in key_bits)
     print(f"[INFO] Watermark Message: {key_str}")
 
@@ -78,7 +83,7 @@ def test_watermark(opt):
     count = 0
 
     with open(output_file, "w") as f:
-        # [新增] 在首行写入水印信息
+        # 在首行写入水印信息
         f.write(f"Watermark_Message (Len={len(key_str)}): {key_str}\n")
         f.write("=" * 80 + "\n")  # 分隔线
 
@@ -116,8 +121,10 @@ def test_watermark(opt):
                 if hasattr(data['camera'], 'image_name'):
                     image_id = data['camera'].image_name
 
+                # [修改点 2] 保存 Render 和 GT 图像
                 if opt.save_images:
                     torchvision.utils.save_image(rendered_image, os.path.join(render_dir, f"{image_id}.png"))
+                    torchvision.utils.save_image(gt_image, os.path.join(gt_dir, f"{image_id}.png"))
 
                 f.write(f"{image_id:<15} | {cur_psnr:<10.4f} | {cur_ssim:<10.4f} | {cur_acc:<10.4f}\n")
 
@@ -129,6 +136,8 @@ def test_watermark(opt):
 
     print(f"\n[DONE] Avg PSNR: {avg_psnr:.4f} | Avg SSIM: {avg_ssim:.4f} | Avg Acc: {avg_acc * 100:.2f}%")
     print(f"Report saved to: {output_file}")
+    if opt.save_images:
+        print(f"Images saved to: {render_dir} and {gt_dir}")
 
 
 if __name__ == '__main__':

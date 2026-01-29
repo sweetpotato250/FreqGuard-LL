@@ -35,7 +35,7 @@ class DWT(nn.Module):
         x_LL = x1 + x2 + x3 + x4
         x_HL = -x1 - x2 + x3 + x4
         x_LH = -x1 + x2 - x3 + x4
-        x_HH = x1 - x2 - x3 + x4
+        x_HH = x1 - x2 + x3 + x4
         return torch.cat([x_LL, x_HL, x_LH, x_HH], dim=1)
 
 
@@ -198,27 +198,28 @@ def train_watermark(opt, dataloader, gaussians):
     for param in inn_model.parameters():
         param.requires_grad = False
 
-    # 6. 设置 Gaussian 优化器
+    # 6. 设置 Gaussian 优化器并冻结几何参数
+    print("Setting up Gaussian optimizer and freezing geometry (xyz, rotation, scaling)...")
     gaussians.training_setup()
 
-    # ==========================================================================
-    # [逻辑保留] 冻结几何参数 (xyz, rotation, scaling)
-    # ==========================================================================
-    print("Configuring Optimizer: Freezing xyz, rotation, scaling...")
+    # 显式冻结几何参数的梯度计算
+    gaussians._xyz.requires_grad = False
+    gaussians._rotation.requires_grad = False
+    gaussians._scaling.requires_grad = False
 
-    freeze_params = ['xyz', 'rotation', 'scaling']
+    # 确保颜色和不透明度参数是可训练的
+    gaussians._features_dc.requires_grad = True
+    gaussians._features_rest.requires_grad = True
+    gaussians._opacity.requires_grad = True
 
-    for param_group in gaussians.optimizer.param_groups:
-        name = param_group['name']
-        if name in freeze_params:
-            param_group['lr'] = 0.0
-            for param in param_group['params']:
-                param.requires_grad = False
-            print(f"  -> Frozen parameter group: {name}")
+    # 调整优化器中的学习率（将不需要更新的参数 LR 设为 0）
+    frozen_names = ['xyz', 'rotation', 'scaling']
+    for group in gaussians.optimizer.param_groups:
+        if group['name'] in frozen_names:
+            group['lr'] = 0.0
         else:
-            param_group['lr'] *= 0.5
-            print(f"  -> Active parameter group: {name} (LR scaled by 0.5)")
-    # ==========================================================================
+            # 仅对微调参数 (SH, opacity) 降低学习率，保持稳定性
+            group['lr'] *= 0.5
 
     bg_color = [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -229,6 +230,8 @@ def train_watermark(opt, dataloader, gaussians):
 
     ema_psnr, ema_acc, ema_loss = 0.0, 0.0, 0.0
     lambda_ber = 0.1
+
+    # 标记是否警告过
     warned_missing_mask = False
 
     for iteration in progress_bar:
@@ -238,37 +241,23 @@ def train_watermark(opt, dataloader, gaussians):
             dataloader_iter = iter(dataloader)
             data = next(dataloader_iter)
 
-        # 获取 Ground Truth 并获取尺寸基准 [1, 3, H, W]
         gt_image = data['camera'].original_image.cuda().unsqueeze(0)
-        B, C, H, W = gt_image.shape
 
-        # ======================================================================
-        # [严谨修复] 统一 Mask 尺寸，防止 500 vs 512 报错
-        # ======================================================================
+        # tool_mask: 1=Tissue, 0=Tool
+        tool_mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0)
 
-        # 1. 处理 Tool Mask
-        tool_mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0).float()
-        # 如果尺寸不匹配，强制插值对齐
-        if tool_mask.shape[2] != H or tool_mask.shape[3] != W:
-            tool_mask = F.interpolate(tool_mask, size=(H, W), mode='nearest')
-
-        # 2. 处理 Lesion Mask
+        # 安全获取病变掩码
         if 'lesion_mask' in data:
-            lesion_mask = data['lesion_mask'].cuda().unsqueeze(0).unsqueeze(0).float()
-            # 如果尺寸不匹配，强制插值对齐
-            if lesion_mask.shape[2] != H or lesion_mask.shape[3] != W:
-                lesion_mask = F.interpolate(lesion_mask, size=(H, W), mode='nearest')
+            lesion_mask = data['lesion_mask'].cuda().unsqueeze(0).unsqueeze(0)
         else:
-            # 缺失时告警并创建全 1 Mask
             if not warned_missing_mask and iteration == 0:
-                print(f"\n[WARNING] 'lesion_mask' not found! Fallback to ONES with shape ({H}, {W}).")
+                print("\n[WARNING] 'lesion_mask' not found in dataloader! Fallback to ONES (Assuming no lesions).")
                 warned_missing_mask = True
+            # Default to all ones (All safe/Non-Lesion)
             lesion_mask = torch.ones_like(tool_mask)
 
-        # ======================================================================
-
         # --- 定义 RONI (非病变区域) ---
-        # 此时 roni_mask 尺寸保证是 [1, 1, H, W]
+        # 既是非器械 (1)，也是非病变 (1) => 结果为 1
         roni_mask = tool_mask * lesion_mask
 
         # --- 腐蚀操作 (去除边缘伪影) ---
@@ -288,7 +277,6 @@ def train_watermark(opt, dataloader, gaussians):
             wm_full = inn_model.embed(gt_image, watermark_key)
 
         # 物理拼接: 只在最终掩码区用水印图
-        # 由于我们前面保证了 Mask 尺寸与 gt_image 一致，这里不会报错
         target_image = wm_full * final_embed_mask + gt_image * (1.0 - final_embed_mask)
 
         # --- Loss ---
@@ -316,28 +304,15 @@ def train_watermark(opt, dataloader, gaussians):
                 "Acc": f"{ema_acc:.2f}"
             })
 
-    # ==========================================================================
-    # [逻辑保留] 保存到 iteration 文件夹
-    # ==========================================================================
-    print(f"\nSaving final models...")
-
+    # 保存结果
     if opt.workspace is not None:
         os.makedirs(opt.workspace, exist_ok=True)
 
+    print(f"Saving models to {opt.workspace}...")
     gaussians.save(opt.workspace, max_iter, "fine")
 
-    iteration_dir = os.path.join(opt.workspace, "point_cloud", f"iteration_{max_iter}")
-    os.makedirs(iteration_dir, exist_ok=True)
-
-    wm_inn_path = os.path.join(iteration_dir, "watermark_inn.pth")
-    wm_key_path = os.path.join(iteration_dir, "watermark_key.pth")
-
-    torch.save(inn_model.state_dict(), wm_inn_path)
-    torch.save(watermark_key, wm_key_path)
-
-    print(f"[Success] GS Model saved to: {iteration_dir}")
-    print(f"[Success] Watermark INN saved to: {wm_inn_path}")
-    print(f"[Success] Watermark Key saved to: {wm_key_path}")
+    torch.save(inn_model.state_dict(), os.path.join(opt.workspace, "watermark_inn.pth"))
+    torch.save(watermark_key, os.path.join(opt.workspace, "watermark_key.pth"))
     print("Training Complete!")
 
 

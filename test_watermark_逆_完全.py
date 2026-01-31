@@ -18,7 +18,7 @@ from utils.image_utils import psnr
 
 
 # ==============================================================================
-# SECTION 1: INN Class Definitions (Must match training)
+# SECTION 1: INN Classes
 # ==============================================================================
 class DWT(nn.Module):
     def __init__(self):
@@ -131,20 +131,16 @@ def test_watermark(opt):
     restored_dir = os.path.join(output_dir, "restored")
     for d in [render_dir, ref_dir, restored_dir]: os.makedirs(d, exist_ok=True)
 
-    # 1. Load Watermarked Model
     print(f"[INFO] Loading Watermarked Model: {opt.model_path}")
     wm_gaussians = GaussianModel(opt)
     wm_gaussians.load_ply(os.path.join(opt.model_path, "point_cloud.ply"))
     wm_gaussians.load_model(opt.model_path)
 
-    # 2. Load Reference Model (Source)
-    # Ensure opt.source_model_path is provided
     print(f"[INFO] Loading Reference Model: {opt.source_model_path}")
     ref_gaussians = GaussianModel(opt)
     ref_gaussians.load_ply(os.path.join(opt.source_model_path, "point_cloud.ply"))
     ref_gaussians.load_model(opt.source_model_path)
 
-    # 3. Load INN
     inn_model = WatermarkINN(wm_len=opt.wm_len, alpha=0.1).cuda()
     inn_model.load_state_dict(torch.load(os.path.join(opt.model_path, "watermark_inn.pth")))
     inn_model.eval()
@@ -155,21 +151,21 @@ def test_watermark(opt):
     dataset = EndoDataset(opt, device=device, type='test')
     dataloader = dataset.dataloader()
 
-    video_writer = imageio.get_writer(os.path.join(output_dir, "comparison_ref_vs_wm.mp4"), fps=24, macro_block_size=1)
+    video_writer = imageio.get_writer(os.path.join(output_dir, "comparison.mp4"), fps=24, macro_block_size=1)
     metrics = {'psnr': [], 'ssim': [], 'lpips': [], 'acc': [], 'rec_psnr': []}
     bg = torch.zeros(3, dtype=torch.float32, device="cuda")
 
     with open(os.path.join(output_dir, "report.txt"), "w") as f:
-        f.write(f"Reference Model: {opt.source_model_path}\n")
-        f.write(f"{'ID':<10} | {'PSNR':<8} | {'SSIM':<8} | {'LPIPS':<8} | {'ACC':<8} | {'REC_PSNR':<8}\n")
-        f.write("-" * 70 + "\n")
+        f.write(f"Ref Model: {opt.source_model_path}\n")
+        f.write(f"{'ID':<10} | {'PSNR_BG':<8} | {'SSIM_BG':<8} | {'LPIPS_BG':<8} | {'ACC':<8} | {'REC_BG':<8}\n")
+        f.write("-" * 75 + "\n")
 
         with torch.no_grad():
             for i, data in enumerate(tqdm(dataloader, desc="Testing")):
                 gt_sensor = data['camera'].original_image.cuda().unsqueeze(0)
                 B, C, H, W = gt_sensor.shape
 
-                # Mask Setup
+                # --- [Correction] Mask Logic ---
                 tool_mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0).float()
                 if tool_mask.shape[2] != H or tool_mask.shape[3] != W:
                     tool_mask = F.interpolate(tool_mask, size=(H, W), mode='nearest')
@@ -179,20 +175,21 @@ def test_watermark(opt):
                     if lesion_mask.shape[2] != H or lesion_mask.shape[3] != W:
                         lesion_mask = F.interpolate(lesion_mask, size=(H, W), mode='nearest')
                 else:
-                    lesion_mask = torch.ones_like(tool_mask)
+                    lesion_mask = torch.zeros_like(tool_mask)
 
-                roni_mask = tool_mask * lesion_mask
+                # Valid Background = (1 - Tool) * (1 - Lesion)
+                valid_bg_mask = (1.0 - tool_mask) * (1.0 - lesion_mask)
+
+                # Erode mask for embedding/extraction to be safe
                 erosion_kernel = 21
-                inverted_roni = 1.0 - roni_mask
-                dilated_inverted = F.max_pool2d(inverted_roni, kernel_size=erosion_kernel, stride=1,
-                                                padding=erosion_kernel // 2)
-                final_embed_mask = 1.0 - dilated_inverted
+                dilated_valid = -F.max_pool2d(-valid_bg_mask, kernel_size=erosion_kernel, stride=1,
+                                              padding=erosion_kernel // 2)
+                final_embed_mask = torch.clamp(dilated_valid, 0.0, 1.0)
 
-                # Render 1: Reference
+                # Render
                 render_pkg_ref = render(data['camera'], ref_gaussians, data['time'], bg, stage="fine")
                 ref_image = render_pkg_ref["render"].unsqueeze(0)
 
-                # Render 2: Watermarked
                 render_pkg_wm = render(data['camera'], wm_gaussians, data['time'], bg, stage="fine")
                 wm_image = render_pkg_wm["render"].unsqueeze(0)
 
@@ -200,18 +197,25 @@ def test_watermark(opt):
                 extract_input = wm_image * final_embed_mask
                 restored_masked, w_logits = inn_model.extract(extract_input, gt_watermark=None)
 
-                # Full restored for visualization
                 restored_full = restored_masked * final_embed_mask + ref_image * (1.0 - final_embed_mask)
 
-                # Metrics Calculation (Reference as Ground Truth)
-                cur_psnr = psnr(wm_image * tool_mask, ref_image * tool_mask).mean().double().item()
-                cur_ssim = ssim(wm_image * tool_mask, ref_image * tool_mask).mean().item()
-                cur_lpips = loss_fn_lpips(torch.clamp(wm_image, 0, 1) * 2 - 1,
-                                          torch.clamp(ref_image, 0, 1) * 2 - 1).mean().item()
+                # --- Metrics (Corrected to use valid_bg_mask) ---
+
+                # PSNR (Visual Quality of BG)
+                # Compare: WM Image vs Ref Image (Weighted by valid_bg_mask)
+                cur_psnr = psnr(wm_image * valid_bg_mask, ref_image * valid_bg_mask).mean().double().item()
+                cur_ssim = ssim(wm_image * valid_bg_mask, ref_image * valid_bg_mask).mean().item()
+
+                # LPIPS: We force non-BG areas to black to compare perception of BG only
+                cur_lpips = loss_fn_lpips(
+                    torch.clamp(wm_image * valid_bg_mask, 0, 1) * 2 - 1,
+                    torch.clamp(ref_image * valid_bg_mask, 0, 1) * 2 - 1
+                ).mean().item()
+
                 cur_acc = compute_accuracy(w_logits, watermark_key)
 
-                # Rec PSNR (Restored vs Reference)
-                cur_rec = psnr(restored_masked * final_embed_mask, ref_image * final_embed_mask).mean().double().item()
+                # Rec PSNR (Restoration Quality of BG)
+                cur_rec = psnr(restored_masked * valid_bg_mask, ref_image * valid_bg_mask).mean().double().item()
 
                 metrics['psnr'].append(cur_psnr)
                 metrics['ssim'].append(cur_ssim)
@@ -231,20 +235,19 @@ def test_watermark(opt):
                 video_writer.append_data(tensor2numpy(combined))
 
         avg = {k: np.mean(v) for k, v in metrics.items()}
-        f.write("-" * 70 + "\n")
+        f.write("-" * 75 + "\n")
         f.write(
             f"{'AVG':<10} | {avg['psnr']:<8.2f} | {avg['ssim']:<8.4f} | {avg['lpips']:<8.4f} | {avg['acc']:<8.4f} | {avg['rec_psnr']:<8.2f}\n")
 
     video_writer.close()
-    print(f"\n[DONE] Avg Rec_PSNR (vs Ref): {avg['rec_psnr']:.2f} | Avg Acc: {avg['acc']:.2f}")
+    print(f"\n[DONE] Avg Rec_PSNR (BG): {avg['rec_psnr']:.2f} | Avg Acc: {avg['acc']:.2f}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str, help="Dataset path")
-    parser.add_argument('--model_path', type=str, required=True, help="Path to Watermarked Model")
-    parser.add_argument('--source_model_path', type=str, required=True,
-                        help="Path to Clean Pretrained Model (Reference)")
+    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--source_model_path', type=str, required=True)
     parser.add_argument('--output_path', type=str, default=None)
     parser.add_argument('--wm_len', type=int, default=64)
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])

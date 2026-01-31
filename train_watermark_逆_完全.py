@@ -7,8 +7,7 @@ import argparse
 from tqdm import tqdm
 import numpy as np
 
-# Import EndoGS core modules
-# Adjust these imports if your folder structure is slightly different
+# 导入 EndoGS 核心模块
 from gaussian_core.provider import EndoDataset
 from gaussian_core.utils import seed_everything
 from gaussian_core.gaussian_model import GaussianModel
@@ -18,7 +17,7 @@ from utils.image_utils import psnr
 
 
 # ==============================================================================
-# SECTION 1: INN Core Classes (DWT, IDWT, CouplingLayer, WatermarkINN)
+# SECTION 1: INN Core Classes
 # ==============================================================================
 
 class DWT(nn.Module):
@@ -135,7 +134,7 @@ def compute_accuracy(w_pred_logits, w_gt):
 
 
 # ==============================================================================
-# SECTION 2: Training Logic (Modified for custom GaussianModel)
+# SECTION 2: Training Logic
 # ==============================================================================
 
 def warmup_inn(inn_model, dataloader, watermark_key, fixed_gaussians, epochs=20):
@@ -178,38 +177,24 @@ def warmup_inn(inn_model, dataloader, watermark_key, fixed_gaussians, epochs=20)
 
 
 def train_watermark(opt, dataloader):
-    # -----------------------------------------------------------
     # 1. Load Fixed Reference Model
-    # -----------------------------------------------------------
     print(f"[Init] Loading Fixed Reference Model from {opt.pretrained_model_path}")
     fixed_gaussians = GaussianModel(opt)
     fixed_gaussians.load_ply(os.path.join(opt.pretrained_model_path, "point_cloud.ply"))
-    # Note: We also load deformation model if it exists
     fixed_gaussians.load_model(opt.pretrained_model_path)
 
-    # --- [CRITICAL FIX] Manually Freeze Parameters for Custom GaussianModel ---
+    # Freeze Fixed Model
     print("Freezing fixed reference model parameters...")
     params_to_freeze = [
-        fixed_gaussians._xyz,
-        fixed_gaussians._features_dc,
-        fixed_gaussians._features_rest,
-        fixed_gaussians._scaling,
-        fixed_gaussians._rotation,
-        fixed_gaussians._opacity
+        fixed_gaussians._xyz, fixed_gaussians._features_dc, fixed_gaussians._features_rest,
+        fixed_gaussians._scaling, fixed_gaussians._rotation, fixed_gaussians._opacity
     ]
     for param in params_to_freeze:
-        if param is not None:
-            param.requires_grad = False
-
-    # Also freeze deformation network if it exists
+        if param is not None: param.requires_grad = False
     if hasattr(fixed_gaussians, '_deformation'):
-        for param in fixed_gaussians._deformation.parameters():
-            param.requires_grad = False
-    # -----------------------------------------------------------
+        for param in fixed_gaussians._deformation.parameters(): param.requires_grad = False
 
-    # -----------------------------------------------------------
     # 2. Load Trainable Model
-    # -----------------------------------------------------------
     print(f"[Init] Loading Trainable Model from {opt.pretrained_model_path}")
     trainable_gaussians = GaussianModel(opt)
     trainable_gaussians.load_ply(os.path.join(opt.pretrained_model_path, "point_cloud.ply"))
@@ -226,21 +211,16 @@ def train_watermark(opt, dataloader):
     # 5. Optimizer Setup
     inn_optimizer = optim.Adam(inn_model.parameters(), lr=1e-4)
     inn_model.train()
-
-    # Must call training_setup to initialize optimizer within the class
     trainable_gaussians.training_setup()
 
-    # Only fine-tune color features (f_dc, f_rest)
     hot_params = ['f_dc', 'f_rest']
     for param_group in trainable_gaussians.optimizer.param_groups:
         if param_group['name'] in hot_params:
             param_group['lr'] *= 0.5
-            for param in param_group['params']:
-                param.requires_grad = True
+            for param in param_group['params']: param.requires_grad = True
         else:
             param_group['lr'] = 0.0
-            for param in param_group['params']:
-                param.requires_grad = False
+            for param in param_group['params']: param.requires_grad = False
 
     bg_color = [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -262,33 +242,46 @@ def train_watermark(opt, dataloader):
         gt_sensor_image = data['camera'].original_image.cuda().unsqueeze(0)
         B, C, H, W = gt_sensor_image.shape
 
-        # --- Mask Logic ---
-        tool_mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0).float()
+        # --- Mask Logic (Correction) ---
+        tool_mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0).float()  # 1 on tool, 0 on bg
         if tool_mask.shape[2] != H or tool_mask.shape[3] != W:
             tool_mask = F.interpolate(tool_mask, size=(H, W), mode='nearest')
 
         if 'lesion_mask' in data:
-            lesion_mask = data['lesion_mask'].cuda().unsqueeze(0).unsqueeze(0).float()
+            lesion_mask = data['lesion_mask'].cuda().unsqueeze(0).unsqueeze(0).float()  # 1 on lesion
             if lesion_mask.shape[2] != H or lesion_mask.shape[3] != W:
                 lesion_mask = F.interpolate(lesion_mask, size=(H, W), mode='nearest')
         else:
             if not warned_missing_mask and iteration == 0:
                 print(f"[WARN] No lesion_mask found. Using Ones.")
                 warned_missing_mask = True
-            lesion_mask = torch.ones_like(tool_mask)
+            lesion_mask = torch.zeros_like(tool_mask)  # Assume no lesion if missing
 
-        roni_mask = tool_mask * lesion_mask
+        # [Corrected] Valid Background = NOT Tool AND NOT Lesion
+        # valid_bg_mask = (1 - Tool) * (1 - Lesion)
+        valid_bg_mask = (1.0 - tool_mask) * (1.0 - lesion_mask)
+
+        # RONI (Forbidden Area) for embedding calculation
+        # To match logic: We embed in valid_bg_mask (after erosion)
+        inverted_roni = valid_bg_mask  # This is where we WANT to embed
+
         erosion_kernel = 21
-        inverted_roni = 1.0 - roni_mask
-        dilated_inverted = F.max_pool2d(inverted_roni, kernel_size=erosion_kernel, stride=1,
-                                        padding=erosion_kernel // 2)
-        final_embed_mask = 1.0 - dilated_inverted
+        # Erode the valid area (equivalent to dilating the forbidden area)
+        # Using max_pool on (1 - valid) or min_pool on valid.
+        # Original code used max_pool on inverted_roni? No, original was inconsistent.
+        # Let's simple erode the valid_bg_mask to stay away from boundaries
+        dilated_valid = -F.max_pool2d(-valid_bg_mask, kernel_size=erosion_kernel, stride=1, padding=erosion_kernel // 2)
+        # This is strictly "valid area eroded".
+        final_embed_mask = dilated_valid
+
+        # Clamp to 0-1 just in case
+        final_embed_mask = torch.clamp(final_embed_mask, 0.0, 1.0)
 
         # --- Forward ---
         trainable_gaussians.optimizer.zero_grad(set_to_none=True)
         inn_optimizer.zero_grad()
 
-        # 1. Generate Reference (Ground Truth for Watermarking)
+        # 1. Generate Reference
         with torch.no_grad():
             render_pkg_ref = render(data['camera'], fixed_gaussians, data['time'], background, stage="fine")
             ref_image = render_pkg_ref["render"].unsqueeze(0)
@@ -299,18 +292,23 @@ def train_watermark(opt, dataloader):
 
         # 3. Prepare Target
         wm_full = inn_model.embed(ref_image, watermark_key)
+        # Target: Embed Watermark ONLY in final_embed_mask, else keep Ref
         target_image = wm_full * final_embed_mask + ref_image * (1.0 - final_embed_mask)
 
         # 4. Extract & Restore
         extractor_input = rendered_image * final_embed_mask
         restored_image, w_logits = inn_model.extract(extractor_input, gt_watermark=watermark_key)
 
-        # --- Loss Calculation ---
-        # Compare trainable render against watermarked reference
-        loss_gs = l1_loss(rendered_image * tool_mask, target_image * tool_mask)
+        # --- Loss Calculation [Corrected Masks] ---
+
+        # GS Loss: Rendered should match Target in the Valid Background Area
+        # We can strictly constrain this loss to valid_bg_mask to avoid Tool/Lesion interference
+        loss_gs = l1_loss(rendered_image * valid_bg_mask, target_image * valid_bg_mask)
+
         loss_ber = compute_ber_loss(w_logits, watermark_key)
-        # Compare restored background against clean reference
-        loss_rec = l1_loss(restored_image * final_embed_mask, ref_image * final_embed_mask)
+
+        # Restore Loss: Restored BG should match Reference BG
+        loss_rec = l1_loss(restored_image * valid_bg_mask, ref_image * valid_bg_mask)
 
         loss = loss_gs + lambda_ber * loss_ber + lambda_restore * loss_rec
         loss.backward()
@@ -318,11 +316,13 @@ def train_watermark(opt, dataloader):
         trainable_gaussians.optimizer.step()
         inn_optimizer.step()
 
-        # --- Metrics ---
+        # --- Metrics [Corrected Masks] ---
         with torch.no_grad():
             acc = compute_accuracy(w_logits, watermark_key)
-            cur_psnr = psnr(rendered_image * tool_mask, ref_image * tool_mask).mean().double().item()
-            cur_rec = psnr(restored_image * final_embed_mask, ref_image * final_embed_mask).mean().double().item()
+            # PSNR: Rendered vs Ref (Only in Valid BG)
+            cur_psnr = psnr(rendered_image * valid_bg_mask, ref_image * valid_bg_mask).mean().double().item()
+            # Rec: Restored vs Ref (Only in Valid BG)
+            cur_rec = psnr(restored_image * valid_bg_mask, ref_image * valid_bg_mask).mean().double().item()
 
             ema_psnr = 0.4 * cur_psnr + 0.6 * ema_psnr
             ema_acc = 0.4 * acc + 0.6 * ema_acc
@@ -330,8 +330,8 @@ def train_watermark(opt, dataloader):
 
         if iteration % 10 == 0:
             progress_bar.set_postfix({
-                "PSNR": f"{ema_psnr:.2f}",
-                "Rec": f"{ema_rec:.2f}",
+                "PSNR_BG": f"{ema_psnr:.2f}",
+                "Rec_BG": f"{ema_rec:.2f}",
                 "Acc": f"{ema_acc:.2f}"
             })
 
@@ -348,14 +348,13 @@ def train_watermark(opt, dataloader):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str, help="Dataset path")
-    parser.add_argument('--pretrained_model_path', type=str, required=True,
-                        help="Path to clean pretrained model (Reference)")
+    parser.add_argument('--pretrained_model_path', type=str, required=True)
     parser.add_argument('--workspace', type=str, default='output/watermarked_gs')
     parser.add_argument('--watermark_iters', type=int, default=5000)
     parser.add_argument('--wm_len', type=int, default=64)
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])
 
-    # GS Params (Standard defaults matching your usage)
+    # Standard GS Params
     parser.add_argument('--sh_degree', type=int, default=3)
     parser.add_argument('--percent_dense', type=float, default=0.01)
     parser.add_argument('--position_lr_init', type=float, default=0.00016)

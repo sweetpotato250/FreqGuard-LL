@@ -7,8 +7,7 @@ import argparse
 from tqdm import tqdm
 import numpy as np
 
-# Import EndoGS core modules
-# Adjust these imports if your folder structure is slightly different
+# 导入 EndoGS 核心模块
 from gaussian_core.provider import EndoDataset
 from gaussian_core.utils import seed_everything
 from gaussian_core.gaussian_model import GaussianModel
@@ -18,7 +17,7 @@ from utils.image_utils import psnr
 
 
 # ==============================================================================
-# SECTION 1: INN Core Classes (DWT, IDWT, CouplingLayer, WatermarkINN)
+# SECTION 1: 内置 Watermark Core (DWT, INN, Logic)
 # ==============================================================================
 
 class DWT(nn.Module):
@@ -54,6 +53,7 @@ class IDWT(nn.Module):
         x2 = x[:, out_channel:out_channel * 2, :, :] / 2
         x3 = x[:, out_channel * 2:out_channel * 3, :, :] / 2
         x4 = x[:, out_channel * 3:out_channel * 4, :, :] / 2
+
         h = torch.zeros([in_batch, out_channel, out_height, out_width]).float().to(x.device)
         h[:, :, 0::2, 0::2] = x1 - x2 - x3 + x4
         h[:, :, 1::2, 0::2] = x1 - x2 + x3 - x4
@@ -67,6 +67,7 @@ class CouplingLayer(nn.Module):
         super(CouplingLayer, self).__init__()
         self.split_len1 = in_channels // 2
         self.split_len2 = in_channels - self.split_len1
+
         self.net = nn.Sequential(
             nn.Conv2d(self.split_len1, mid_channels, 3, 1, 1),
             nn.ReLU(),
@@ -79,35 +80,57 @@ class CouplingLayer(nn.Module):
         x1, x2 = torch.split(x, [self.split_len1, self.split_len2], dim=1)
         st = self.net(x1)
         s, t = torch.chunk(st, 2, dim=1)
+        # 限制 scaling 范围防止数值不稳定
         s = torch.sigmoid(s + 2) + 1e-6
+
         if not reverse:
-            return torch.cat([x1, s * x2 + t], dim=1)
+            y1 = x1
+            y2 = s * x2 + t
+            return torch.cat([y1, y2], dim=1)
         else:
-            return torch.cat([x1, (x2 - t) / s], dim=1)
+            y1 = x1
+            y2 = x2
+            x2_restored = (y2 - t) / s
+            return torch.cat([y1, x2_restored], dim=1)
 
 
 class WatermarkINN(nn.Module):
     def __init__(self, in_channels=12, steps=4, wm_len=64, alpha=0.1):
         super(WatermarkINN, self).__init__()
-        self.dwt = DWT();
+        self.dwt = DWT()
         self.idwt = IDWT()
-        self.wm_len = wm_len;
+        self.wm_len = wm_len
         self.alpha = alpha
+
         self.layers = nn.ModuleList([CouplingLayer(in_channels) for _ in range(steps)])
-        self.wm_projector = nn.Sequential(nn.Linear(wm_len, in_channels), nn.ReLU(),
-                                          nn.Linear(in_channels, in_channels))
-        self.wm_extractor = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(), nn.Linear(in_channels, 128),
-                                          nn.ReLU(), nn.Linear(128, wm_len))
+
+        self.wm_projector = nn.Sequential(
+            nn.Linear(wm_len, in_channels),
+            nn.ReLU(),
+            nn.Linear(in_channels, in_channels)
+        )
+
+        self.wm_extractor = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(in_channels, 128),
+            nn.ReLU(),
+            nn.Linear(128, wm_len)
+        )
 
     def get_wm_feature(self, watermark, dims):
-        return self.wm_projector(watermark).unsqueeze(-1).unsqueeze(-1).expand(*dims)
+        B, C, H, W = dims
+        wm_feat = self.wm_projector(watermark).unsqueeze(-1).unsqueeze(-1)
+        return wm_feat.expand(B, C, H, W)
 
     def inn_forward(self, x):
-        for layer in self.layers: x = layer(x, reverse=False)
+        for layer in self.layers:
+            x = layer(x, reverse=False)
         return x
 
     def inn_inverse(self, z):
-        for layer in reversed(self.layers): z = layer(z, reverse=True)
+        for layer in reversed(self.layers):
+            z = layer(z, reverse=True)
         return z
 
     def embed(self, image, watermark):
@@ -115,15 +138,33 @@ class WatermarkINN(nn.Module):
         z = self.inn_forward(coeffs)
         wm_feat = self.get_wm_feature(watermark, z.shape)
         z_watermarked = z + self.alpha * wm_feat
-        return self.idwt(self.inn_inverse(z_watermarked))
+        coeffs_watermarked = self.inn_inverse(z_watermarked)
+        return self.idwt(coeffs_watermarked)
 
     def extract(self, watermarked_image, gt_watermark=None):
+        # 1. Image_wm -> DWT
         coeffs_wm = self.dwt(watermarked_image)
+        # 2. INN Forward -> Latent Z (contains watermark)
         z_rec = self.inn_forward(coeffs_wm)
-        w_logits = self.wm_extractor(z_rec)
-        w_to_subtract = gt_watermark if gt_watermark is not None else (torch.sigmoid(w_logits) > 0.5).float()
-        z_clean = z_rec - self.alpha * self.get_wm_feature(w_to_subtract, z_rec.shape)
-        return self.idwt(self.inn_inverse(z_clean)), w_logits
+
+        # 3. Extract Watermark
+        w_pred_logits = self.wm_extractor(z_rec)
+
+        # 4. Strip Watermark: Z_clean = Z_rec - alpha * W
+        if gt_watermark is not None:
+            w_to_subtract = gt_watermark
+        else:
+            w_to_subtract = (torch.sigmoid(w_pred_logits) > 0.5).float()
+
+        wm_feat_neg = self.get_wm_feature(w_to_subtract, z_rec.shape)
+        z_clean = z_rec - self.alpha * wm_feat_neg
+
+        # 5. INN Inverse
+        coeffs_clean = self.inn_inverse(z_clean)
+        # 6. IDWT -> Restored Image
+        restored_image = self.idwt(coeffs_clean)
+
+        return restored_image, w_pred_logits
 
 
 def compute_ber_loss(w_pred_logits, w_gt):
@@ -131,42 +172,47 @@ def compute_ber_loss(w_pred_logits, w_gt):
 
 
 def compute_accuracy(w_pred_logits, w_gt):
-    return ((torch.sigmoid(w_pred_logits) > 0.5).float() == w_gt).float().mean().item()
+    w_pred_bits = (torch.sigmoid(w_pred_logits) > 0.5).float()
+    correct_bits = (w_pred_bits == w_gt).float()
+    return correct_bits.mean().item()
 
 
 # ==============================================================================
-# SECTION 2: Training Logic (Modified for custom GaussianModel)
+# SECTION 2: 训练辅助函数
 # ==============================================================================
 
-def warmup_inn(inn_model, dataloader, watermark_key, fixed_gaussians, epochs=20):
-    print(f"\n[Phase 1] Warming up INN (Target: Pretrained Render)...")
+def warmup_inn(inn_model, dataloader, watermark_key, epochs=20):
+    """
+    预热 INN：让它先学会 '复制' 和 '简单的嵌入/提取'
+    [改进] 预热时虽然没有复杂的 mask，但网络学会了基本映射。
+    """
+    print(f"\n[Phase 1] Warming up INN for {epochs} epochs...")
     optimizer = optim.Adam(inn_model.parameters(), lr=1e-3)
     inn_model.train()
-    bg_color = [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     for epoch in range(epochs):
         epoch_acc = 0
         limit_batches = 50
+
         pbar = tqdm(enumerate(dataloader), total=limit_batches, desc=f"Warmup {epoch + 1}/{epochs}", leave=False)
 
         for i, data in pbar:
             if i >= limit_batches: break
 
-            with torch.no_grad():
-                render_pkg_ref = render(data['camera'], fixed_gaussians, data['time'], background, stage="fine")
-                ref_image = render_pkg_ref["render"].unsqueeze(0)
+            gt_image = data['camera'].original_image.cuda().unsqueeze(0)
 
-            wm_image = inn_model.embed(ref_image, watermark_key)
+            # Forward
+            wm_image = inn_model.embed(gt_image, watermark_key)
             restored_image, w_logits = inn_model.extract(wm_image, gt_watermark=watermark_key)
 
-            loss_visual = l1_loss(wm_image, ref_image)
-            loss_restore = l1_loss(restored_image, ref_image)
+            loss_visual = l1_loss(wm_image, gt_image)
+            loss_restore = l1_loss(restored_image, gt_image)
             loss_bits = compute_ber_loss(w_logits, watermark_key)
 
             loss = loss_visual + loss_bits + loss_restore
-            optimizer.zero_grad();
-            loss.backward();
+
+            optimizer.zero_grad()
+            loss.backward()
             optimizer.step()
 
             acc = compute_accuracy(w_logits, watermark_key)
@@ -177,75 +223,43 @@ def warmup_inn(inn_model, dataloader, watermark_key, fixed_gaussians, epochs=20)
     return inn_model
 
 
-def train_watermark(opt, dataloader):
-    # -----------------------------------------------------------
-    # 1. Load Fixed Reference Model
-    # -----------------------------------------------------------
-    print(f"[Init] Loading Fixed Reference Model from {opt.pretrained_model_path}")
-    fixed_gaussians = GaussianModel(opt)
-    fixed_gaussians.load_ply(os.path.join(opt.pretrained_model_path, "point_cloud.ply"))
-    # Note: We also load deformation model if it exists
-    fixed_gaussians.load_model(opt.pretrained_model_path)
+# ==============================================================================
+# SECTION 3: 主训练逻辑
+# ==============================================================================
 
-    # --- [CRITICAL FIX] Manually Freeze Parameters for Custom GaussianModel ---
-    print("Freezing fixed reference model parameters...")
-    params_to_freeze = [
-        fixed_gaussians._xyz,
-        fixed_gaussians._features_dc,
-        fixed_gaussians._features_rest,
-        fixed_gaussians._scaling,
-        fixed_gaussians._rotation,
-        fixed_gaussians._opacity
-    ]
-    for param in params_to_freeze:
-        if param is not None:
-            param.requires_grad = False
+def train_watermark(opt, dataloader, gaussians):
+    print(f"Loading Gaussians from {opt.pretrained_model_path}")
+    gaussians.load_ply(os.path.join(opt.pretrained_model_path, "point_cloud.ply"))
+    gaussians.load_model(opt.pretrained_model_path)
 
-    # Also freeze deformation network if it exists
-    if hasattr(fixed_gaussians, '_deformation'):
-        for param in fixed_gaussians._deformation.parameters():
-            param.requires_grad = False
-    # -----------------------------------------------------------
-
-    # -----------------------------------------------------------
-    # 2. Load Trainable Model
-    # -----------------------------------------------------------
-    print(f"[Init] Loading Trainable Model from {opt.pretrained_model_path}")
-    trainable_gaussians = GaussianModel(opt)
-    trainable_gaussians.load_ply(os.path.join(opt.pretrained_model_path, "point_cloud.ply"))
-    trainable_gaussians.load_model(opt.pretrained_model_path)
-
-    # 3. INN Setup
     inn_model = WatermarkINN(wm_len=opt.wm_len, alpha=0.1).cuda()
     watermark_key = torch.randint(0, 2, (1, opt.wm_len)).float().cuda()
     print(f"Generated Key: {watermark_key[0, :10].cpu().numpy()}...")
 
-    # 4. Warmup
-    inn_model = warmup_inn(inn_model, dataloader, watermark_key, fixed_gaussians, epochs=20)
+    inn_model = warmup_inn(inn_model, dataloader, watermark_key, epochs=20)
 
-    # 5. Optimizer Setup
+    print("Configuring Optimizers for Joint Training...")
     inn_optimizer = optim.Adam(inn_model.parameters(), lr=1e-4)
     inn_model.train()
 
-    # Must call training_setup to initialize optimizer within the class
-    trainable_gaussians.training_setup()
-
-    # Only fine-tune color features (f_dc, f_rest)
+    gaussians.training_setup()
     hot_params = ['f_dc', 'f_rest']
-    for param_group in trainable_gaussians.optimizer.param_groups:
-        if param_group['name'] in hot_params:
+    for param_group in gaussians.optimizer.param_groups:
+        name = param_group['name']
+        if name in hot_params:
             param_group['lr'] *= 0.5
-            for param in param_group['params']:
-                param.requires_grad = True
+            for param in param_group['params']: param.requires_grad = True
         else:
             param_group['lr'] = 0.0
-            for param in param_group['params']:
-                param.requires_grad = False
+            for param in param_group['params']: param.requires_grad = False
 
     bg_color = [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    progress_bar = tqdm(range(opt.watermark_iters), desc="[Phase 2] Joint Training")
+    iter_start = 0
+    max_iter = opt.watermark_iters
+    progress_bar = tqdm(range(iter_start, max_iter), desc="[Phase 2] Joint Training")
+
     ema_psnr, ema_acc, ema_rec = 0.0, 0.0, 0.0
     warned_missing_mask = False
 
@@ -259,10 +273,10 @@ def train_watermark(opt, dataloader):
             dataloader_iter = iter(dataloader)
             data = next(dataloader_iter)
 
-        gt_sensor_image = data['camera'].original_image.cuda().unsqueeze(0)
-        B, C, H, W = gt_sensor_image.shape
+        gt_image = data['camera'].original_image.cuda().unsqueeze(0)
+        B, C, H, W = gt_image.shape
 
-        # --- Mask Logic ---
+        # --- Mask 处理 ---
         tool_mask = data['mask'].cuda().unsqueeze(0).unsqueeze(0).float()
         if tool_mask.shape[2] != H or tool_mask.shape[3] != W:
             tool_mask = F.interpolate(tool_mask, size=(H, W), mode='nearest')
@@ -277,52 +291,59 @@ def train_watermark(opt, dataloader):
                 warned_missing_mask = True
             lesion_mask = torch.ones_like(tool_mask)
 
+        # 1. 生成嵌入掩码
         roni_mask = tool_mask * lesion_mask
         erosion_kernel = 21
         inverted_roni = 1.0 - roni_mask
+        # 使用 max_pool2d 进行膨胀 (相当于对 RONI 进行腐蚀)
         dilated_inverted = F.max_pool2d(inverted_roni, kernel_size=erosion_kernel, stride=1,
                                         padding=erosion_kernel // 2)
-        final_embed_mask = 1.0 - dilated_inverted
+        final_embed_mask = 1.0 - dilated_inverted  # 背景为 1，器械为 0
 
-        # --- Forward ---
-        trainable_gaussians.optimizer.zero_grad(set_to_none=True)
+        # --- 训练步 ---
+        gaussians.optimizer.zero_grad(set_to_none=True)
         inn_optimizer.zero_grad()
 
-        # 1. Generate Reference (Ground Truth for Watermarking)
-        with torch.no_grad():
-            render_pkg_ref = render(data['camera'], fixed_gaussians, data['time'], background, stage="fine")
-            ref_image = render_pkg_ref["render"].unsqueeze(0)
-
-            # 2. Generate Trainable Render
-        render_pkg = render(data['camera'], trainable_gaussians, data['time'], background, stage="fine")
+        # 2. Render GS
+        render_pkg = render(data['camera'], gaussians, data['time'], background, stage="fine")
         rendered_image = render_pkg["render"].unsqueeze(0)
 
-        # 3. Prepare Target
-        wm_full = inn_model.embed(ref_image, watermark_key)
-        target_image = wm_full * final_embed_mask + ref_image * (1.0 - final_embed_mask)
+        # 3. 生成目标图像 (Ground Truth + Watermark)
+        wm_full = inn_model.embed(gt_image, watermark_key)
+        # [逻辑修正] 目标图像 = (水印图 * 掩码) + (原图 * (1-掩码))
+        target_image = wm_full * final_embed_mask + gt_image * (1.0 - final_embed_mask)
 
-        # 4. Extract & Restore
+        # 4. 提取与复原 (关键修改点!)
+        # [修改] 强制将输入给 Extractor 的图像在器械区域置为 0
+        # 这迫使 INN 只能从背景区域学习水印，而不能依赖器械区域的像素
         extractor_input = rendered_image * final_embed_mask
+
         restored_image, w_logits = inn_model.extract(extractor_input, gt_watermark=watermark_key)
 
-        # --- Loss Calculation ---
-        # Compare trainable render against watermarked reference
+        # --- Loss ---
+        # L1: GS 渲染图逼近目标图 (背景带水印，前景干净)
         loss_gs = l1_loss(rendered_image * tool_mask, target_image * tool_mask)
+
+        # L2: 水印提取 Loss
         loss_ber = compute_ber_loss(w_logits, watermark_key)
-        # Compare restored background against clean reference
-        loss_rec = l1_loss(restored_image * final_embed_mask, ref_image * final_embed_mask)
+
+        # L3: 复原 Loss (仅计算掩码区域)
+        # [修改] 我们只关心背景（有水印的地方）复原后是否等于原图。
+        # 器械区域因为输入被置0了，复原出来肯定是黑的，不能跟原图算 Loss
+        loss_rec = l1_loss(restored_image * final_embed_mask, gt_image * final_embed_mask)
 
         loss = loss_gs + lambda_ber * loss_ber + lambda_restore * loss_rec
-        loss.backward()
 
-        trainable_gaussians.optimizer.step()
+        loss.backward()
+        gaussians.optimizer.step()
         inn_optimizer.step()
 
-        # --- Metrics ---
+        # --- Logs ---
         with torch.no_grad():
             acc = compute_accuracy(w_logits, watermark_key)
-            cur_psnr = psnr(rendered_image * tool_mask, ref_image * tool_mask).mean().double().item()
-            cur_rec = psnr(restored_image * final_embed_mask, ref_image * final_embed_mask).mean().double().item()
+            cur_psnr = psnr(rendered_image * tool_mask, gt_image * tool_mask).mean().double().item()
+            # Rec 只计算有效区域
+            cur_rec = psnr(restored_image * final_embed_mask, gt_image * final_embed_mask).mean().double().item()
 
             ema_psnr = 0.4 * cur_psnr + 0.6 * ema_psnr
             ema_acc = 0.4 * acc + 0.6 * ema_acc
@@ -331,14 +352,14 @@ def train_watermark(opt, dataloader):
         if iteration % 10 == 0:
             progress_bar.set_postfix({
                 "PSNR": f"{ema_psnr:.2f}",
-                "Rec": f"{ema_rec:.2f}",
+                "Rec_Bg": f"{ema_rec:.2f}",
                 "Acc": f"{ema_acc:.2f}"
             })
 
     print(f"\nSaving to {opt.workspace}...")
     os.makedirs(opt.workspace, exist_ok=True)
-    trainable_gaussians.save(opt.workspace, opt.watermark_iters, "fine")
-    ckpt_dir = os.path.join(opt.workspace, "point_cloud", f"iteration_{opt.watermark_iters}")
+    gaussians.save(opt.workspace, max_iter, "fine")
+    ckpt_dir = os.path.join(opt.workspace, "point_cloud", f"iteration_{max_iter}")
     os.makedirs(ckpt_dir, exist_ok=True)
     torch.save(inn_model.state_dict(), os.path.join(ckpt_dir, "watermark_inn.pth"))
     torch.save(watermark_key, os.path.join(ckpt_dir, "watermark_key.pth"))
@@ -348,33 +369,35 @@ def train_watermark(opt, dataloader):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str, help="Dataset path")
-    parser.add_argument('--pretrained_model_path', type=str, required=True,
-                        help="Path to clean pretrained model (Reference)")
+    parser.add_argument('--pretrained_model_path', type=str, required=True)
     parser.add_argument('--workspace', type=str, default='output/watermarked_gs')
     parser.add_argument('--watermark_iters', type=int, default=5000)
     parser.add_argument('--wm_len', type=int, default=64)
-    parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])
+    parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1], help="Data range to use")
 
-    # GS Params (Standard defaults matching your usage)
+    # GS Params
     parser.add_argument('--sh_degree', type=int, default=3)
-    parser.add_argument('--percent_dense', type=float, default=0.01)
     parser.add_argument('--position_lr_init', type=float, default=0.00016)
     parser.add_argument('--feature_lr', type=float, default=0.0025)
     parser.add_argument('--opacity_lr', type=float, default=0.05)
     parser.add_argument('--scaling_lr', type=float, default=0.005)
     parser.add_argument('--rotation_lr', type=float, default=0.001)
-    parser.add_argument('--position_lr_final', type=float, default=0.0000016)
-    parser.add_argument('--position_lr_delay_mult', type=float, default=0.01)
-    parser.add_argument('--position_lr_max_steps', type=int, default=1000000)
-    parser.add_argument('--grid_lr_init', type=float, default=0.00015)
-    parser.add_argument('--grid_lr_final', type=float, default=0.000015)
-    parser.add_argument('--deformation_lr_init', type=float, default=0.000015)
-    parser.add_argument('--deformation_lr_final', type=float, default=0.0000015)
-    parser.add_argument('--deformation_lr_delay_mult', type=float, default=0.01)
-    parser.add_argument('--deformation_lr_max_steps', type=int, default=1000000)
 
     opt, _ = parser.parse_known_args()
+
+    opt.percent_dense = 0.01
+    opt.position_lr_final = 0.0000016
+    opt.position_lr_delay_mult = 0.01
+    opt.position_lr_max_steps = 1000000
+    opt.grid_lr_init = 0.00015
+    opt.grid_lr_final = 0.000015
+    opt.deformation_lr_init = 0.000015
+    opt.deformation_lr_final = 0.0000015
+    opt.deformation_lr_delay_mult = 0.01
+    opt.deformation_lr_max_steps = 1000000
+
     seed_everything(0)
+    gaussians = GaussianModel(opt)
     device = torch.device('cuda')
     dataset = EndoDataset(opt, device=device, type='train')
-    train_watermark(opt, dataset.dataloader())
+    train_watermark(opt, dataset.dataloader(), gaussians)

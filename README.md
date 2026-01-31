@@ -35,11 +35,11 @@ python train.py {data path} --workspace {workspace}
 ## e.g.,
 python train.py data/endonerf/cutting/ --workspace output/cutting/
 
-python train_watermark.py data/endonerf/cutting/ \
-    --pretrained_model_path output/cutting/point_cloud/iteration_60000/ \
-    --inn_path output/inn_pretrain/ \
-    --workspace output/cutting_watermarked/ \
-    --watermark_iters 5000
+python train_watermark.py data/endonerf/pulling \
+    --pretrained_model_path output/clean_model \
+    --workspace output/watermarked_model \
+    --watermark_iters 5000 \
+    --wm_len 64
 
 ```
 
@@ -59,11 +59,12 @@ python eval_rgb.py --gt_dir data/cutting_tissues_twice/images --mask_dir data/cu
 Note: we should use the same masks in training and evaluation. If the name 'gt_masks' exist, we use 'gt_masks'; if not, use 'masks'. And we exclude the unseen pixels in gt and rendered images for PSNR.
 
 ## Test
-
-python test_watermark.py data/endonerf/cutting_tissues_twice/ \
-    --model_path output/watermarked_model \
+```
+python test_watermark.py data/endonerf/pulling \
+    --model_path output/watermarked_model/point_cloud/iteration_5000 \
     --output_path output/test_results \
-    --save_images
+    --wm_len 64
+```
 
 ## Citation
 

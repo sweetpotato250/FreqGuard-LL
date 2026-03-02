@@ -10,179 +10,51 @@ from PIL import Image
 
 class RobustnessAttacker:
     """
-    针对 3DGS 水印的专用攻击库。
-    参数严格对应用户要求：
-    1. Gaussian Noise (v=0.1)
-    2. Rotation (±π/6)
-    3. Scaling (25%)
-    4. Gaussian Blur (deviation=0.1 - 注：实际通常指sigma，此处映射为sigma)
-    5. Crop (40%)
-    6. Brightness (x2.0)
-    7. JPEG (Q=10)
-    8. Combined (Crop + Brightness + JPEG)
+    针对 3DGS 医学影像（临床/传输场景）的专用水印鲁棒性攻击库。
+    参数严格对应医疗场景要求：
+    1. 信号噪声 (Gaussian Noise): 扫描/传输噪声，σ=0.001~0.01
+    2. 顶点简化 (Vertex Simplification): 降低模型分辨率，简化率 10%~30%
+    3. 平滑滤波 (Smooth Filtering): 去除扫描噪声，核大小 3x3，迭代 1~3 次
+    4. 相似变换 (Similarity Transform): 不同设备对齐，旋转 ±15°，平移 ±5mm
+    5. 格式转换 (Format Conversion): 格式互转导致精度丢失 (截断模拟)
+    6. 轻微裁剪 (Mild Cropping): 避开器官主体，裁剪面积 < 10%
     """
 
     # ==========================================================================
-    # 1. 高斯噪声攻击 (Gaussian Noise)
-    # 参数：v = 0.1 (此处理解为标准差 sigma=0.1，若是方差则 sigma≈0.316)
+    # 1. 扫描/传输信号噪声 (Gaussian Noise)
+    # 医疗扫描精度级：σ = 0.001 ~ 0.01
     # ==========================================================================
     @staticmethod
-    def attack_noise(image, std=0.1):
-        """
-        image: (B, C, H, W), range [0, 1]
-        std: 噪声强度 (默认 v=0.1)
-        """
+    def attack_noise_2d(image, std=0.005):
+        """对 2D 渲染切片添加微弱信号噪声 (默认 σ=0.005)"""
         noise = torch.randn_like(image) * std
         return torch.clamp(image + noise, 0, 1)
 
+    @staticmethod
+    def attack_noise_3d(gaussian_model, std=0.005):
+        """对 3DGS 模型的空间坐标(XYZ)添加微量扫描噪声"""
+        original_xyz = gaussian_model._xyz.clone()
+        noise = torch.randn_like(gaussian_model._xyz) * std
+        gaussian_model._xyz.data += noise
+        return original_xyz  # 返回原坐标用于后续恢复
+
     # ==========================================================================
-    # 2. 旋转攻击 (Rotation)
-    # 参数：±π/6 (30度)
+    # 2. 临床预览顶点简化 / 下采样 (Vertex Simplification)
+    # 保留关键解剖结构：简化率 10% ~ 30%
     # ==========================================================================
     @staticmethod
-    def attack_rotation(image, angle_deg=30):
+    def get_pruning_mask(gaussian_model, prune_percent=0.20):
         """
-        将图像旋转指定角度。
-        angle_deg: 默认为 30 度 (π/6)
+        基于不透明度 (Opacity) 剪枝，模拟临床 3D 预览模型下采样。
+        默认 prune_percent=0.20 (剔除 20% 最不重要的点)
         """
-        # 随机选择顺时针或逆时针，或者固定
-        # 为了测试确定性，这里默认 +30 度，也可传入 -30
-        return TF.rotate(image, angle_deg, interpolation=TF.InterpolationMode.BILINEAR)
-
-    # ==========================================================================
-    # 3. 缩放攻击 (Scaling)
-    # 参数：25% 比例 (即缩小到 0.25x 再放大回原尺寸)
-    # ==========================================================================
-    @staticmethod
-    def attack_scaling(image, scale=0.25):
-        """
-        模拟分辨率降低。
-        scale: 0.25 表示缩小为原图的 1/4 (25%)
-        """
-        B, C, H, W = image.shape
-        new_H, new_W = int(H * scale), int(W * scale)
-
-        # 1. Downsample (丢失高频信息)
-        downscaled = F.interpolate(image, size=(new_H, new_W), mode='bilinear', align_corners=False)
-
-        # 2. Upsample (恢复 INN 输入尺寸)
-        recovered = F.interpolate(downscaled, size=(H, W), mode='bilinear', align_corners=False)
-        return recovered
-
-    # ==========================================================================
-    # 4. 高斯模糊攻击 (Gaussian Blur)
-    # 参数：deviation = 0.1 (映射为 sigma)
-    # 注意：Sigma=0.1 视觉效果极弱，如果需要明显模糊建议设为 1.0 或 2.0
-    # ==========================================================================
-    @staticmethod
-    def attack_blur(image, sigma=1.0, kernel_size=5):
-        """
-        sigma: 标准差 (deviation)
-        kernel_size: 卷积核大小，通常设为 5 或 7
-        """
-        # 保证核大小是奇数
-        if kernel_size % 2 == 0: kernel_size += 1
-
-        # 使用 TorchVision 的模糊
-        blur_transform = T.GaussianBlur(kernel_size=(kernel_size, kernel_size), sigma=sigma)
-        return blur_transform(image)
-
-    # ==========================================================================
-    # 5. 裁剪攻击 (Crop)
-    # 参数：40% 比例裁剪 (解释为：切掉 40% 的内容 / 或保留 60% 的中心内容)
-    # 此处实现：保留中心 60% 的区域 (切除边缘 40%)，然后拉伸回原尺寸
-    # ==========================================================================
-    @staticmethod
-    def attack_crop(image, crop_percent=0.4):
-        """
-        crop_percent: 0.4 (表示切掉 40%，保留 1 - 0.4 = 0.6)
-        """
-        B, C, H, W = image.shape
-        keep_ratio = 1.0 - crop_percent  # 0.6
-
-        crop_h = int(H * keep_ratio)
-        crop_w = int(W * keep_ratio)
-
-        # 中心裁剪
-        cropped = TF.center_crop(image, [crop_h, crop_w])
-
-        # 拉伸回原尺寸 (模拟局部放大/视野丢失)
-        resized = F.interpolate(cropped, size=(H, W), mode='bilinear', align_corners=False)
-        return resized
-
-    # ==========================================================================
-    # 6. 亮度调整攻击 (Brightness)
-    # 参数：亮度 x 2.0
-    # ==========================================================================
-    @staticmethod
-    def attack_brightness(image, factor=2.0):
-        """
-        factor: 2.0 (两倍亮度)
-        """
-        return torch.clamp(image * factor, 0, 1)
-
-    # ==========================================================================
-    # 7. JPEG 压缩攻击 (JPEG Compression)
-    # 参数：Quality = 10% (极强压缩)
-    # ==========================================================================
-    @staticmethod
-    def attack_jpeg(image, quality=10):
-        """
-        真实的 JPEG 压缩模拟 (Tensor -> PIL -> Buffer -> PIL -> Tensor)
-        这是最准确的模拟，包含块效应和色彩量化。
-        """
-        # 确保输入在 CPU
-        img_cpu = image.detach().cpu()
-        processed_imgs = []
-
-        for i in range(img_cpu.shape[0]):
-            # 1. 转换为 PIL
-            tensor_img = img_cpu[i]
-            pil_img = TF.to_pil_image(tensor_img.clamp(0, 1))
-
-            # 2. 写入内存 Buffer (模拟存盘)
-            buffer = io.BytesIO()
-            pil_img.save(buffer, format="JPEG", quality=quality)
-
-            # 3. 重新读取
-            buffer.seek(0)
-            jpeg_img = Image.open(buffer)
-
-            # 4. 转回 Tensor
-            tensor_out = TF.to_tensor(jpeg_img)
-            processed_imgs.append(tensor_out)
-
-        # 堆叠回 Batch 并送回原设备
-        return torch.stack(processed_imgs).to(image.device)
-
-    # ==========================================================================
-    # 8. 组合攻击 (Combined)
-    # 顺序：裁剪(Crop) -> 亮度(Brightness) -> JPEG
-    # ==========================================================================
-    @staticmethod
-    def attack_combined(image):
-        """
-        组合攻击：
-        1. Crop (40%)
-        2. Brightness (x2.0)
-        3. JPEG (Q=10)
-        """
-        x = RobustnessAttacker.attack_crop(image, crop_percent=0.4)
-        x = RobustnessAttacker.attack_brightness(x, factor=2.0)
-        x = RobustnessAttacker.attack_jpeg(x, quality=10)
-        return x
-
-    # ==========================================================================
-    # 3D 模型攻击 (保留你的 3D 剪枝功能)
-    # ==========================================================================
-    @staticmethod
-    def get_pruning_mask(gaussian_model, prune_percent=0.5):
         opacities = gaussian_model._opacity.detach().squeeze()
         k = int(opacities.shape[0] * prune_percent)
-        if k == 0: return torch.ones_like(opacities, dtype=torch.bool)
+        if k == 0:
+            return torch.ones_like(opacities, dtype=torch.bool)
         try:
             threshold, _ = torch.kthvalue(opacities, k)
-        except:
+        except RuntimeError:
             threshold, _ = torch.kthvalue(opacities.cpu(), k)
             threshold = threshold.to(opacities.device)
         return opacities > threshold
@@ -193,6 +65,104 @@ class RobustnessAttacker:
         gaussian_model._opacity.data[~mask] = 0.0
         return original_opacity
 
+    # ==========================================================================
+    # 3. 平滑滤波 (Smooth Filtering)
+    # 去除扫描噪声：高斯平滑核大小 3×3，迭代 1~3 次
+    # ==========================================================================
+    @staticmethod
+    def attack_smooth_2d(image, kernel_size=3, iterations=2):
+        """
+        模拟医疗影像后处理中的常规平滑去噪。
+        采用较小的高斯核 (3x3)，以保留解剖边缘。
+        """
+        sigma = 0.5
+        blur_transform = T.GaussianBlur(kernel_size=(kernel_size, kernel_size), sigma=sigma)
+
+        smoothed = image
+        for _ in range(iterations):
+            smoothed = blur_transform(smoothed)
+        return smoothed
+
+    # ==========================================================================
+    # 4. 相似变换 (Similarity Transform: Rotation / Translation)
+    # 不同设备/视角对齐：旋转 ±15°，平移 ±5mm (假设 1 坐标单位=1米，5mm=0.005)
+    # ==========================================================================
+    @staticmethod
+    def attack_transform_3d(gaussian_model, angle_deg=15.0, trans_units=0.005):
+        """对 3DGS 模型本身进行刚体变换 (此处以绕 Y 轴旋转为例)"""
+        original_xyz = gaussian_model._xyz.clone()
+
+        # 构造旋转矩阵
+        theta = np.radians(angle_deg)
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        rot_mat = torch.tensor([
+            [cos_t, 0, sin_t],
+            [0, 1, 0],
+            [-sin_t, 0, cos_t]
+        ], device=gaussian_model._xyz.device, dtype=gaussian_model._xyz.dtype)
+
+        # 应用旋转与平移
+        rotated_xyz = torch.matmul(gaussian_model._xyz.data, rot_mat.T)
+        translated_xyz = rotated_xyz + trans_units
+
+        gaussian_model._xyz.data = translated_xyz
+        return original_xyz
+
+    # ==========================================================================
+    # 5. 格式转换 (Format Conversion)
+    # PLY -> OBJ -> 3DGS 转换：模拟精度截断与重组
+    # ==========================================================================
+    @staticmethod
+    def attack_format_conversion_3d(gaussian_model):
+        """
+        通过 ASCII 格式（如 OBJ）互转时，浮点数往往被截断到 4 位小数。
+        这里模拟底层坐标与 DC 属性的极微小精度丢失（量化误差）。
+        """
+        original_xyz = gaussian_model._xyz.clone()
+        original_features = gaussian_model._features_dc.clone()
+
+        # 模拟浮点数截断 (Float32 -> ASCII 4位小数 -> Float32)
+        gaussian_model._xyz.data = torch.round(gaussian_model._xyz.data * 10000) / 10000
+        gaussian_model._features_dc.data = torch.round(gaussian_model._features_dc.data * 10000) / 10000
+
+        return original_xyz, original_features
+
+    # ==========================================================================
+    # 6. 轻微裁剪 (Mild Cropping)
+    # 裁剪非关键背景：面积 < 10% (避开器官主体)
+    # ==========================================================================
+    @staticmethod
+    def attack_mild_crop_2d(image, crop_percent=0.05):
+        """
+        crop_percent: 默认 0.05 (切掉 5%，保留中心 95%)。
+        避免像以前 40% 那样破坏主要解剖结构。
+        """
+        B, C, H, W = image.shape
+        keep_ratio = 1.0 - crop_percent
+
+        crop_h = int(H * keep_ratio)
+        crop_w = int(W * keep_ratio)
+
+        # 居中裁剪并拉伸回原尺寸
+        cropped = TF.center_crop(image, [crop_h, crop_w])
+        resized = F.interpolate(cropped, size=(H, W), mode='bilinear', align_corners=False)
+        return resized
+
+    # ==========================================================================
+    # 通用恢复函数 (Restore Modules)
+    # 必须在每次测试完 3D 攻击后调用，以避免影响下一次测试
+    # ==========================================================================
     @staticmethod
     def restore_model(gaussian_model, original_opacity):
+        """恢复透明度 (供剪枝测试后调用)"""
         gaussian_model._opacity.data = original_opacity
+
+    @staticmethod
+    def restore_model_xyz(gaussian_model, original_xyz):
+        """恢复 3D 坐标 (供平移、旋转、噪声测试后调用)"""
+        gaussian_model._xyz.data = original_xyz
+
+    @staticmethod
+    def restore_model_features(gaussian_model, original_features):
+        """恢复颜色/特征 (供格式转换测试后调用)"""
+        gaussian_model._features_dc.data = original_features

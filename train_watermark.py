@@ -6,6 +6,7 @@ import os
 import argparse
 from tqdm import tqdm
 import numpy as np
+import random  # [新增] 用于随机攻击选择
 
 # Import EndoGS core modules
 from gaussian_core.provider import EndoDataset
@@ -15,9 +16,12 @@ from gaussian_renderer import render
 from utils.loss_utils import l1_loss
 from utils.image_utils import psnr
 
+# [新增] 引入攻击模块 (确保 robustness_utils.py 在同级目录下)
+from robustness_utils import RobustnessAttacker
+
 
 # ==============================================================================
-# SECTION 1: INN Core Classes
+# SECTION 1: INN Core Classes (保持 Code A 的结构不变)
 # ==============================================================================
 
 class DWT(nn.Module):
@@ -94,20 +98,17 @@ class WatermarkINN(nn.Module):
         self.alpha = alpha
 
         # --- Subband Selection Logic ---
-        # Assuming RGB input, DWT output is 12 channels. Each subband has 3 channels.
         self.c_per_subband = in_channels // 4
         subband_order = ['LL', 'HL', 'LH', 'HH']
 
         if subbands.lower() == 'all':
             selected_names = subband_order
         else:
-            # e.g., "LL,HH" -> ['LL', 'HH']
             selected_names = [s.strip() for s in subbands.split(',')]
 
         self.active_indices = []
         self.passive_indices = []
 
-        # Build indices based on subband selection
         for i, name in enumerate(subband_order):
             indices = list(range(i * self.c_per_subband, (i + 1) * self.c_per_subband))
             if name in selected_names:
@@ -115,14 +116,12 @@ class WatermarkINN(nn.Module):
             else:
                 self.passive_indices.extend(indices)
 
-        # Register buffers so they move to GPU automatically
         self.register_buffer('active_idx', torch.tensor(self.active_indices, dtype=torch.long))
         self.register_buffer('passive_idx', torch.tensor(self.passive_indices, dtype=torch.long))
 
         self.inn_channels = len(self.active_indices)
         print(f"[WatermarkINN] Subbands: {subbands} | Active Channels: {self.inn_channels}")
 
-        # --- Dynamic Network Construction ---
         self.layers = nn.ModuleList([CouplingLayer(self.inn_channels) for _ in range(steps)])
         self.wm_projector = nn.Sequential(
             nn.Linear(wm_len, self.inn_channels),
@@ -151,7 +150,6 @@ class WatermarkINN(nn.Module):
         return z
 
     def split_features(self, coeffs):
-        """Separate coefficients into active (to be processed) and passive (to remain unchanged)"""
         x_active = torch.index_select(coeffs, 1, self.active_idx)
         if len(self.passive_indices) > 0:
             x_passive = torch.index_select(coeffs, 1, self.passive_idx)
@@ -160,10 +158,8 @@ class WatermarkINN(nn.Module):
         return x_active, x_passive
 
     def merge_features(self, x_active, x_passive, original_shape):
-        """Reassemble the coefficients"""
         if x_passive is None:
             return x_active
-
         out = torch.zeros(original_shape, device=x_active.device, dtype=x_active.dtype)
         out.index_copy_(1, self.active_idx, x_active)
         out.index_copy_(1, self.passive_idx, x_passive)
@@ -173,15 +169,11 @@ class WatermarkINN(nn.Module):
         coeffs = self.dwt(image)
         z_active, z_passive = self.split_features(coeffs)
 
-        # Only transform active subbands
         z_transformed = self.inn_forward(z_active)
         wm_feat = self.get_wm_feature(watermark, z_transformed.shape)
         z_watermarked = z_transformed + self.alpha * wm_feat
 
-        # Restore active part
         x_active_restored = self.inn_inverse(z_watermarked)
-
-        # Merge back
         coeffs_watermarked = self.merge_features(x_active_restored, z_passive, coeffs.shape)
         return self.idwt(coeffs_watermarked)
 
@@ -189,14 +181,12 @@ class WatermarkINN(nn.Module):
         coeffs_wm = self.dwt(watermarked_image)
         z_active, z_passive = self.split_features(coeffs_wm)
 
-        # INN forward on active part
         z_rec = self.inn_forward(z_active)
         w_logits = self.wm_extractor(z_rec)
 
         w_to_subtract = gt_watermark if gt_watermark is not None else (torch.sigmoid(w_logits) > 0.5).float()
         z_clean_active = z_rec - self.alpha * self.get_wm_feature(w_to_subtract, z_rec.shape)
 
-        # Restore clean image (needed for loss calculation)
         x_active_clean = self.inn_inverse(z_clean_active)
         coeffs_clean = self.merge_features(x_active_clean, z_passive, coeffs_wm.shape)
 
@@ -212,7 +202,7 @@ def compute_accuracy(w_pred_logits, w_gt):
 
 
 # ==============================================================================
-# SECTION 2: Training Logic
+# SECTION 2: Training Logic (Modified for Robustness)
 # ==============================================================================
 
 def warmup_inn(inn_model, dataloader, watermark_key, fixed_gaussians, epochs=20):
@@ -261,27 +251,16 @@ def train_watermark(opt, dataloader):
     print(f"[Init] Loading Fixed Reference Model from {opt.pretrained_model_path}")
     fixed_gaussians = GaussianModel(opt)
     fixed_gaussians.load_ply(os.path.join(opt.pretrained_model_path, "point_cloud.ply"))
-    # Note: We also load deformation model if it exists
     fixed_gaussians.load_model(opt.pretrained_model_path)
 
-    # --- Manually Freeze Parameters ---
+    # Freeze params
     print("Freezing fixed reference model parameters...")
-    params_to_freeze = [
-        fixed_gaussians._xyz,
-        fixed_gaussians._features_dc,
-        fixed_gaussians._features_rest,
-        fixed_gaussians._scaling,
-        fixed_gaussians._rotation,
-        fixed_gaussians._opacity
-    ]
+    params_to_freeze = [fixed_gaussians._xyz, fixed_gaussians._features_dc, fixed_gaussians._features_rest,
+                        fixed_gaussians._scaling, fixed_gaussians._rotation, fixed_gaussians._opacity]
     for param in params_to_freeze:
-        if param is not None:
-            param.requires_grad = False
-
+        if param is not None: param.requires_grad = False
     if hasattr(fixed_gaussians, '_deformation'):
-        for param in fixed_gaussians._deformation.parameters():
-            param.requires_grad = False
-    # -----------------------------------------------------------
+        for param in fixed_gaussians._deformation.parameters(): param.requires_grad = False
 
     # -----------------------------------------------------------
     # 2. Load Trainable Model
@@ -292,7 +271,6 @@ def train_watermark(opt, dataloader):
     trainable_gaussians.load_model(opt.pretrained_model_path)
 
     # 3. INN Setup
-    # [MODIFIED] Using opt.subbands
     inn_model = WatermarkINN(wm_len=opt.wm_len, alpha=0.1, subbands=opt.subbands).cuda()
     watermark_key = torch.randint(0, 2, (1, opt.wm_len)).float().cuda()
     print(f"Generated Key: {watermark_key[0, :10].cpu().numpy()}...")
@@ -303,7 +281,6 @@ def train_watermark(opt, dataloader):
     # 5. Optimizer Setup
     inn_optimizer = optim.Adam(inn_model.parameters(), lr=1e-4)
     inn_model.train()
-
     trainable_gaussians.training_setup()
 
     # Only fine-tune color features
@@ -311,12 +288,10 @@ def train_watermark(opt, dataloader):
     for param_group in trainable_gaussians.optimizer.param_groups:
         if param_group['name'] in hot_params:
             param_group['lr'] *= 0.5
-            for param in param_group['params']:
-                param.requires_grad = True
+            for param in param_group['params']: param.requires_grad = True
         else:
             param_group['lr'] = 0.0
-            for param in param_group['params']:
-                param.requires_grad = False
+            for param in param_group['params']: param.requires_grad = False
 
     bg_color = [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -327,6 +302,9 @@ def train_watermark(opt, dataloader):
 
     lambda_ber = 0.1
     lambda_restore = 2.0
+
+    # [新增] 攻击参数
+    aug_prob = 0.5  # 50% 概率受到攻击
 
     for iteration in progress_bar:
         try:
@@ -369,22 +347,56 @@ def train_watermark(opt, dataloader):
             render_pkg_ref = render(data['camera'], fixed_gaussians, data['time'], background, stage="fine")
             ref_image = render_pkg_ref["render"].unsqueeze(0)
 
-        # 2. Trainable Render
+        # 2. Trainable Render (Watermarked by GS optimization)
         render_pkg = render(data['camera'], trainable_gaussians, data['time'], background, stage="fine")
         rendered_image = render_pkg["render"].unsqueeze(0)
 
-        # 3. Target
+        # 3. Target (INN Embed for Visual Supervision)
         wm_full = inn_model.embed(ref_image, watermark_key)
         target_image = wm_full * final_embed_mask + ref_image * (1.0 - final_embed_mask)
 
-        # 4. Extract
-        extractor_input = rendered_image * final_embed_mask
+        # 4. Robustness Extraction (加入攻击层!)
+        # 复制一份用于提取，保持原始 rendered_image 用于计算视觉 Loss
+        extractor_input_raw = rendered_image.clone()
+
+        # [修改] 训练期间施加攻击
+        is_attacked = False
+        if torch.rand(1).item() < aug_prob:
+            is_attacked = True
+            aug_type = torch.randint(0, 5, (1,)).item()
+
+            # 使用较温和的参数以防止色偏
+            if aug_type == 0:  # Noise
+                extractor_input_raw = RobustnessAttacker.attack_noise(extractor_input_raw, std=0.05)
+            elif aug_type == 1:  # Scaling (温和缩放，0.8 而非 0.25)
+                # 注意：DWT 对分辨率敏感，缩放后需要 resize 回来，或者让网络适应模糊
+                extractor_input_raw = RobustnessAttacker.attack_scaling(extractor_input_raw, scale=0.8)
+                # 插值回原尺寸以便和 mask 对齐 (这对 DWT 也是一种攻击，相当于 blur)
+                extractor_input_raw = F.interpolate(extractor_input_raw, size=(H, W), mode='bilinear')
+            elif aug_type == 2:  # Blur
+                extractor_input_raw = RobustnessAttacker.attack_blur(extractor_input_raw, sigma=0.5)
+            elif aug_type == 3:  # Brightness
+                extractor_input_raw = RobustnessAttacker.attack_brightness(extractor_input_raw, factor=1.2)
+            elif aug_type == 4:  # Crop (温和裁剪)
+                # 简单 Crop 可能会导致 mask 不对齐，但在训练中作为一种 noise 引入
+                extractor_input_raw = RobustnessAttacker.attack_crop(extractor_input_raw, crop_percent=0.1)
+                extractor_input_raw = F.interpolate(extractor_input_raw, size=(H, W), mode='bilinear')
+
+        # 应用 mask 准备提取
+        extractor_input = extractor_input_raw * final_embed_mask
+
+        # 提取水印
         restored_image, w_logits = inn_model.extract(extractor_input, gt_watermark=watermark_key)
 
         # --- Loss ---
         loss_gs = l1_loss(rendered_image * tool_mask, target_image * tool_mask)
         loss_ber = compute_ber_loss(w_logits, watermark_key)
-        loss_rec = l1_loss(restored_image * final_embed_mask, ref_image * final_embed_mask)
+
+        # 如果受到了攻击，提取出的图像肯定和原图不像，所以仅在未攻击时强烈约束 loss_rec
+        if is_attacked:
+            loss_rec = l1_loss(restored_image * final_embed_mask, ref_image * final_embed_mask) * 0.1
+        else:
+            loss_rec = l1_loss(restored_image * final_embed_mask, ref_image * final_embed_mask)
 
         loss = loss_gs + lambda_ber * loss_ber + lambda_restore * loss_rec
         loss.backward()
@@ -416,6 +428,11 @@ def train_watermark(opt, dataloader):
     os.makedirs(ckpt_dir, exist_ok=True)
     torch.save(inn_model.state_dict(), os.path.join(ckpt_dir, "watermark_inn.pth"))
     torch.save(watermark_key, os.path.join(ckpt_dir, "watermark_key.pth"))
+
+    # [新增] 保存训练配置，方便 Test 读取
+    with open(os.path.join(ckpt_dir, "train_config.txt"), "w") as f:
+        f.write(f"subbands: {opt.subbands}\n")
+
     print("Done!")
 
 
@@ -427,7 +444,7 @@ if __name__ == '__main__':
     parser.add_argument('--workspace', type=str, default='output/watermarked_gs')
     parser.add_argument('--watermark_iters', type=int, default=5000)
     parser.add_argument('--wm_len', type=int, default=64)
-    # [MODIFIED] Renamed to --subbands
+    # [Code A 特性] 支持子带选择
     parser.add_argument('--subbands', type=str, default='all',
                         help='Subbands to embed: "all", "LL", "HL,LH", etc.')
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1])

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import argparse
-import math
+import math  # [新增]
 from tqdm import tqdm
 import torchvision
 import numpy as np
@@ -17,11 +17,12 @@ from gaussian_renderer import render
 from utils.loss_utils import ssim
 from utils.image_utils import psnr
 
+# 引入攻击库
 from robustness_utils import RobustnessAttacker
 
 
 # ==============================================================================
-# SECTION 1: INN Class Definitions (保持动态容量结构)
+# SECTION 1: INN Class Definitions
 # ==============================================================================
 class DWT(nn.Module):
     def __init__(self):
@@ -58,6 +59,7 @@ class IDWT(nn.Module):
         return h
 
 
+# [第二步对齐] 重要性映射模块
 class ImportanceMapModule(nn.Module):
     def __init__(self, in_channels=3, out_channels=1):
         super(ImportanceMapModule, self).__init__()
@@ -103,6 +105,8 @@ class WatermarkINN(nn.Module):
         self.idwt = IDWT()
         self.wm_len = wm_len
         self.alpha = alpha
+
+        # [第二步对齐]
         self.im_module = ImportanceMapModule(in_channels=3)
 
         self.c_per_subband = in_channels // 4
@@ -115,6 +119,7 @@ class WatermarkINN(nn.Module):
 
         self.active_indices = []
         self.passive_indices = []
+
         for i, name in enumerate(subband_order):
             indices = list(range(i * self.c_per_subband, (i + 1) * self.c_per_subband))
             if name in selected_names:
@@ -126,18 +131,26 @@ class WatermarkINN(nn.Module):
         self.register_buffer('passive_idx', torch.tensor(self.passive_indices, dtype=torch.long))
 
         self.inn_channels = len(self.active_indices)
+
+        # --- [核心修改] 动态自适应网络容量 (与训练对齐) ---
         target_features = max(128, wm_len * 2)
         self.spatial_size = max(1, math.ceil(math.sqrt(target_features / self.inn_channels)))
         spatial_dim = self.inn_channels * self.spatial_size * self.spatial_size
         hidden_dim = max(256, wm_len * 2)
 
         self.layers = nn.ModuleList([CouplingLayer(self.inn_channels) for _ in range(steps)])
+
         self.wm_projector = nn.Sequential(
-            nn.Linear(wm_len, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, spatial_dim)
+            nn.Linear(wm_len, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, spatial_dim)
         )
         self.wm_extractor = nn.Sequential(
-            nn.AdaptiveAvgPool2d((self.spatial_size, self.spatial_size)), nn.Flatten(),
-            nn.Linear(spatial_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, wm_len)
+            nn.AdaptiveAvgPool2d((self.spatial_size, self.spatial_size)),
+            nn.Flatten(),
+            nn.Linear(spatial_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, wm_len)
         )
 
     def get_wm_feature(self, watermark, dims):
@@ -163,20 +176,25 @@ class WatermarkINN(nn.Module):
         return x_active, x_passive
 
     def merge_features(self, x_active, x_passive, original_shape):
-        if x_passive is None: return x_active
+        if x_passive is None:
+            return x_active
         out = torch.zeros(original_shape, device=x_active.device, dtype=x_active.dtype)
         out.index_copy_(1, self.active_idx, x_active)
         out.index_copy_(1, self.passive_idx, x_passive)
         return out
 
+    # 测试阶段仅调用 extract，但保留 embed 结构完整性
     def embed(self, image, watermark):
         coeffs = self.dwt(image)
         ll_subband = coeffs[:, :3, :, :]
         M = self.im_module(ll_subband)
+
         z_active, z_passive = self.split_features(coeffs)
         z_transformed = self.inn_forward(z_active)
         wm_feat = self.get_wm_feature(watermark, z_transformed.shape)
+
         z_watermarked = z_transformed + self.alpha * M * wm_feat
+
         x_active_restored = self.inn_inverse(z_watermarked)
         coeffs_watermarked = self.merge_features(x_active_restored, z_passive, coeffs.shape)
         return self.idwt(coeffs_watermarked)
@@ -185,14 +203,21 @@ class WatermarkINN(nn.Module):
         coeffs_wm = self.dwt(watermarked_image)
         ll_subband_wm = coeffs_wm[:, :3, :, :]
         M = self.im_module(ll_subband_wm)
+
         z_active, z_passive = self.split_features(coeffs_wm)
+
         z_rec = self.inn_forward(z_active)
         w_logits = self.wm_extractor(z_rec)
+
         w_to_subtract = gt_watermark if gt_watermark is not None else (torch.sigmoid(w_logits) > 0.5).float()
         wm_feat_sub = self.get_wm_feature(w_to_subtract, z_rec.shape)
+
+        # [第二步对齐] 应用 Importance Map 进行逆向相减
         z_clean_active = z_rec - self.alpha * M * wm_feat_sub
+
         x_active_clean = self.inn_inverse(z_clean_active)
         coeffs_clean = self.merge_features(x_active_clean, z_passive, coeffs_wm.shape)
+
         return self.idwt(coeffs_clean), w_logits
 
 
@@ -207,6 +232,8 @@ def compute_accuracy(w_pred_logits, w_gt):
 def test_watermark(opt):
     if not opt.model_path.endswith("/"): opt.model_path += "/"
     output_dir = opt.output_path if opt.output_path else opt.model_path
+
+    # [清理] 彻底移除了没有实际写入作用的 render_dir 避免产生空文件夹
     vis_root = os.path.join(output_dir, "visualizations")
 
     print(f"[INFO] Loading Watermarked Model: {opt.model_path}")
@@ -234,14 +261,15 @@ def test_watermark(opt):
     inn_model = WatermarkINN(wm_len=opt.wm_len, alpha=0.1, subbands=opt.subbands).cuda()
     inn_model.load_state_dict(torch.load(os.path.join(opt.model_path, "watermark_inn.pth")))
     inn_model.eval()
+
     watermark_key = torch.load(os.path.join(opt.model_path, "watermark_key.pth")).cuda()
+
     loss_fn_lpips = lpips.LPIPS(net='alex').cuda()
     device = torch.device('cuda')
     dataset = EndoDataset(opt, device=device, type='test')
     dataloader = dataset.dataloader()
 
-    # 将攻击分为 2D 和 3D 两组
-    attack_dict_2d = {
+    attack_dict = {
         "Clean": lambda x: x,
         "Noise": lambda x: RobustnessAttacker.attack_noise(x, std=0.1),
         "Rot": lambda x: RobustnessAttacker.attack_rotation(x, angle_deg=30),
@@ -253,32 +281,34 @@ def test_watermark(opt):
         "Comb": lambda x: RobustnessAttacker.attack_combined(x)
     }
 
-    attack_dict_3d = {
-        "Prune": "3d_pruning",
-        "XYZ": "3d_xyz_noise",
-        "View": "3d_view_change"
-    }
+    if opt.specific_attack != 'all':
+        if opt.specific_attack in attack_dict:
+            attack_dict = {opt.specific_attack: attack_dict[opt.specific_attack]}
+        else:
+            print(f"[WARN] Attack {opt.specific_attack} not found, running all.")
 
-    metrics = {'psnr': [], 'ssim': [], 'lpips': [], 'r_psnr': [], 'r_ssim': []}
+    # [清理] 移除提前批量创建空文件夹的逻辑，改为稍后在保存时懒加载创建
 
-    all_attacks = list(attack_dict_2d.keys()) + list(attack_dict_3d.keys())
-    for atk_name in all_attacks:
+    metrics = {'psnr': [], 'ssim': [], 'lpips': []}
+    for atk_name in attack_dict.keys():
         metrics[f'acc_{atk_name}'] = []
 
     bg = torch.zeros(3, dtype=torch.float32, device="cuda")
     report_path = os.path.join(output_dir, "robustness_report.txt")
+
+    # 确保根目录存在用于存 txt 报告
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"[INFO] Testing started.")
+
     with open(report_path, "w") as f:
         f.write(f"Reference Model: {opt.source_model_path}\n")
         f.write(f"Watermarked Model: {opt.model_path}\n")
         f.write(f"Subbands: {opt.subbands}\n")
-        f.write("-" * 110 + "\n")
+        f.write("-" * 80 + "\n")
 
-        # 表头加入了可逆性指标 R_PSNR 和 R_SSIM
-        header = f"{'ID':<6} | {'PSNR':<6} | {'SSIM':<6} | {'LPIPS':<6} | {'R_PSNR':<6} | {'R_SSIM':<6}"
-        for atk_name in all_attacks:
+        header = f"{'ID':<6} | {'PSNR':<6} | {'SSIM':<6} | {'LPIPS':<6}"
+        for atk_name in attack_dict.keys():
             header += f" | {atk_name[:6]:<6}"
         f.write(header + "\n")
         f.write("-" * len(header) + "\n")
@@ -286,6 +316,7 @@ def test_watermark(opt):
         with torch.no_grad():
             for i, data in enumerate(tqdm(dataloader, desc="Robustness Testing")):
                 name = data['camera'].image_name if hasattr(data['camera'], 'image_name') else f"{i:04d}"
+
                 gt_sensor = data['camera'].original_image.cuda().unsqueeze(0)
                 B, C, H, W = gt_sensor.shape
 
@@ -307,7 +338,6 @@ def test_watermark(opt):
                                                 padding=erosion_kernel // 2)
                 final_embed_mask = 1.0 - dilated_inverted
 
-                # 渲染基础图
                 render_pkg_ref = render(data['camera'], ref_gaussians, data['time'], bg, stage="fine")
                 ref_image = render_pkg_ref["render"].unsqueeze(0)
 
@@ -319,76 +349,36 @@ def test_watermark(opt):
                 cur_lpips = loss_fn_lpips(torch.clamp(wm_image, 0, 1) * 2 - 1,
                                           torch.clamp(ref_image, 0, 1) * 2 - 1).mean().item()
 
-                # ==========================================
-                # 修复缺陷一：评估并记录可逆性 (Restored Metrics)
-                # ==========================================
-                extract_input_clean = wm_image * final_embed_mask
-                # 注意这里 gt_watermark=None，是盲提取模式下的恢复测试
-                restored_image, _ = inn_model.extract(extract_input_clean, gt_watermark=None)
-
-                r_psnr = psnr(torch.clamp(restored_image, 0, 1) * final_embed_mask,
-                              ref_image * final_embed_mask).mean().double().item()
-                r_ssim = ssim(torch.clamp(restored_image, 0, 1) * final_embed_mask,
-                              ref_image * final_embed_mask).mean().item()
-
                 metrics['psnr'].append(cur_psnr)
                 metrics['ssim'].append(cur_ssim)
                 metrics['lpips'].append(cur_lpips)
-                metrics['r_psnr'].append(r_psnr)
-                metrics['r_ssim'].append(r_ssim)
 
-                row_str = f"{name:<6} | {cur_psnr:<6.2f} | {cur_ssim:<6.3f} | {cur_lpips:<6.3f} | {r_psnr:<6.2f} | {r_ssim:<6.3f}"
+                row_str = f"{name:<6} | {cur_psnr:<6.2f} | {cur_ssim:<6.3f} | {cur_lpips:<6.3f}"
 
-                # 1. 执行 2D 攻击评测
-                for atk_name, attack_fn in attack_dict_2d.items():
+                for atk_name, attack_fn in attack_dict.items():
+
                     attacked_image = attack_fn(wm_image.clone())
-                    if i < 20:
-                        save_dir = os.path.join(vis_root, atk_name)
-                        os.makedirs(save_dir, exist_ok=True)
-                        torchvision.utils.save_image(attacked_image, os.path.join(save_dir, f"{name}.png"))
-
-                    extract_input = attacked_image * final_embed_mask
-                    _, w_logits = inn_model.extract(extract_input, gt_watermark=None)
-                    cur_acc = compute_accuracy(w_logits, watermark_key)
-                    metrics[f'acc_{atk_name}'].append(cur_acc)
-                    row_str += f" | {cur_acc:<6.2f}"
-
-                # 2. 执行 3D 特有攻击评测 (修复缺陷二)
-                for atk_name, action in attack_dict_3d.items():
-                    attacked_image = None
-                    if action == "3d_pruning":
-                        orig_opac = RobustnessAttacker.apply_pruning(wm_gaussians, prune_percent=0.1)
-                        attacked_pkg = render(data['camera'], wm_gaussians, data['time'], bg, stage="fine")
-                        attacked_image = attacked_pkg["render"].unsqueeze(0)
-                        RobustnessAttacker.restore_attribute(wm_gaussians, '_opacity', orig_opac)
-
-                    elif action == "3d_xyz_noise":
-                        orig_xyz = RobustnessAttacker.apply_xyz_noise(wm_gaussians, std=0.005)
-                        attacked_pkg = render(data['camera'], wm_gaussians, data['time'], bg, stage="fine")
-                        attacked_image = attacked_pkg["render"].unsqueeze(0)
-                        RobustnessAttacker.restore_attribute(wm_gaussians, '_xyz', orig_xyz)
-
-                    elif action == "3d_view_change":
-                        new_cam = RobustnessAttacker.perturb_camera(data['camera'], trans_std=0.02)
-                        attacked_pkg = render(new_cam, wm_gaussians, data['time'], bg, stage="fine")
-                        attacked_image = attacked_pkg["render"].unsqueeze(0)
 
                     if i < 20:
+                        # [清理] 只有真正需要存图时，才生成对应的可视化文件夹，彻底杜绝生成空文件夹
                         save_dir = os.path.join(vis_root, atk_name)
                         os.makedirs(save_dir, exist_ok=True)
-                        torchvision.utils.save_image(attacked_image, os.path.join(save_dir, f"{name}.png"))
+                        save_path = os.path.join(save_dir, f"{name}.png")
+                        torchvision.utils.save_image(attacked_image, save_path)
 
                     extract_input = attacked_image * final_embed_mask
+
                     _, w_logits = inn_model.extract(extract_input, gt_watermark=None)
                     cur_acc = compute_accuracy(w_logits, watermark_key)
+
                     metrics[f'acc_{atk_name}'].append(cur_acc)
                     row_str += f" | {cur_acc:<6.2f}"
 
                 f.write(row_str + "\n")
 
         f.write("-" * len(header) + "\n")
-        avg_str = f"{'AVG':<6} | {np.mean(metrics['psnr']):<6.2f} | {np.mean(metrics['ssim']):<6.3f} | {np.mean(metrics['lpips']):<6.3f} | {np.mean(metrics['r_psnr']):<6.2f} | {np.mean(metrics['r_ssim']):<6.3f}"
-        for atk_name in all_attacks:
+        avg_str = f"{'AVG':<6} | {np.mean(metrics['psnr']):<6.2f} | {np.mean(metrics['ssim']):<6.3f} | {np.mean(metrics['lpips']):<6.3f}"
+        for atk_name in attack_dict.keys():
             avg_acc = np.mean(metrics[f'acc_{atk_name}'])
             avg_str += f" | {avg_acc:<6.2f}"
 
@@ -396,7 +386,6 @@ def test_watermark(opt):
 
     print(f"\n[DONE] Test Finished.")
     print(f"Summary saved to {report_path}")
-    print(f"Average Restored PSNR: {np.mean(metrics['r_psnr']):.2f} dB (证明可逆性!)")
 
 
 if __name__ == '__main__':

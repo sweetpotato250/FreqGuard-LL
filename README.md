@@ -10,7 +10,7 @@ This is the official code for https://arxiv.org/abs/2401.11535.
 
 Clone this repository and install packages:
 ```
-git clone https://github.com/HKU-MedAI/EndoGS.git
+git clone https://github.com/sweetpotato250/FreqGuard-LL.git
 conda env create --file environment.yml
 conda activate gs
 pip install git+https://github.com/ingra14m/depth-diff-gaussian-rasterization.git@depth

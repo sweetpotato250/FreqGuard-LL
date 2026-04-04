@@ -5,8 +5,10 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="3a499882-345d-4061-b2c7-e75930c411e0" name="更改" comment="">
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/eval_watermark.py" beforeDir="false" afterPath="$PROJECT_DIR$/eval_watermark.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/gaussian_core/watermark_model.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/eval_watermark.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/finetune_watermark.py" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -37,7 +39,7 @@
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
     "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "正在合并 master",
+    "git-widget-placeholder": "master",
     "last_opened_file_path": "D:/learn_python/MedicalGS"
   }
 }]]></component>
